@@ -255,7 +255,7 @@ class SleepQualityTrackerCapability(MatchingCapability):
 
         parts = [f"Logged — {hours:.1f} hours, {quality}/10."]
         if quality >= avg_quality + 1.5:
-            parts.append(f"That's one of your better nights this week.")
+            parts.append("That's one of your better nights this week.")
         elif quality <= avg_quality - 1.5:
             parts.append(f"Rougher than your usual {avg_quality:.1f} average this week.")
 
