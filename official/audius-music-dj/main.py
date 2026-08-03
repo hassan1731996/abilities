@@ -2,7 +2,6 @@ import logging
 import json
 import httpx
 import asyncio
-import requests
 import re
 
 from src.agent.capability import MatchingCapability
@@ -135,7 +134,7 @@ class AudiusMusicDjCapability(MatchingCapability):
     def _get_host(self):
         """Get the best available host from Audius"""
         try:
-            response = requests.get(AUDIUS_API)
+            response = self.worker.session_tasks.get(AUDIUS_API)
             if response.status_code == 200:
                 return response.json().get('data')[0]
             return None
@@ -307,7 +306,7 @@ class AudiusMusicDjCapability(MatchingCapability):
 
             # Search tracks on Audius
             search_endpoint = f"{self.host}/v1/tracks/search"
-            response = requests.get(
+            response = await self.worker.session_tasks.get_async(
                 search_endpoint,
                 params=params,
                 headers={
@@ -336,7 +335,7 @@ class AudiusMusicDjCapability(MatchingCapability):
                     
                     if search_query:
                         params["query"] = search_query
-                        response = requests.get(search_endpoint, params=params, headers={
+                        response = await self.worker.session_tasks.get_async(search_endpoint, params=params, headers={
                             "Accept": "application/json",
                             "User-Agent": f"{self.app_name}/1.0"
                         })
@@ -504,7 +503,7 @@ class AudiusMusicDjCapability(MatchingCapability):
                 track_id = fav["song_id"]
                 track_endpoint = f"{self.host}/v1/tracks/{track_id}"
 
-                track_response = requests.get(
+                track_response = await self.worker.session_tasks.get_async(
                     track_endpoint,
                     headers={
                         "Accept": "application/json",
