@@ -51,6 +51,7 @@ templates/
 ├── basic-template/        ← Start here. Minimal Skill skeleton.
 ├── api-template/          ← Call an external REST API from a Skill.
 ├── loop-template/         ← Long-running looped Skill (ambient observer).
+├── music-template/        ← Stream a track; branch on how playback ended.
 │
 ├── SendEmail/             ← Fire-and-forget SDK method call.
 ├── Local/                 ← LLM as translator; execute on local machine.
@@ -233,6 +234,25 @@ Demonstrates nearly every advanced SDK pattern: raw audio recording, external AP
 
 ---
 
+#### [`music-template`](./templates/music-template) — Interruptible Playback
+**Type:** Skill · **Pattern:** Play-and-branch · **Complexity:** Minimal
+
+Plays a track from your music API and stays in control of what happens next. `stream_music_from_url()` blocks for the whole track and returns **why** playback ended — `finished`, `paused`, `stopped`, `unplayable` or `error`. The audio pipeline, the device buffer, music mode and the recovery afterwards are all inside the call, so `speak()` works on the very next line no matter how it ended.
+
+**Key SDK methods:** `stream_music_from_url()`, `run_io_loop()`, `speak()`, `resume_normal_flow()`
+
+**Key patterns:**
+
+- **Music mode:** while a stream is live the Ability receives no transcriptions and must not call `speak()` or `run_io_loop()`. "pause" and "stop" from the user come back as `outcome` values instead of events you handle.
+- **Resume is just calling again:** there is no separate resume function. Pass `result["position"]` as `start_seconds` and `result["byte_offset"]` as `byte_offset`, and re-resolve the URL — signed CDN links expire while the user sits paused.
+- **Only `"paused"` loops:** `finished`, `stopped`, `error` and `unplayable` all leave. A loop that retries on `error` spins.
+
+> `duration_seconds` is the **FULL** track length — the call subtracts `start_seconds` itself. Wrong values don't crash anything, they just make `position` drift so a later resume starts in the wrong place.
+
+**Build on top:** a full music DJ, a sleep-timer radio, a podcast player with chapter resume, a story-time reader.
+
+---
+
 ### 🟡 Utility Pattern
 
 ---
@@ -267,6 +287,7 @@ self.capability_worker.write_file("state.json", json.dumps(data))
 | `Background` | Background Daemon | `get_full_message_history()`, `session_tasks.sleep()` |
 | `Alarm` | Skill + Daemon | `send_interrupt_signal()`, `play_from_audio_file()`, `session_tasks.sleep()` |
 | `loop-template` | Skill (long-running) | `start_audio_recording()`, `get_audio_recording()`, `text_to_text_response()` |
+| `music-template` | Skill | `stream_music_from_url()`, `run_io_loop()`, `resume_normal_flow()` |
 | `ReadWriteFile` | Utility / IPC | `read_file()`, `delete_file()`, `write_file()` |
 
 ---
