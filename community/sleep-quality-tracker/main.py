@@ -147,21 +147,41 @@ class SleepQualityTrackerCapability(MatchingCapability):
     # Setup
     # ------------------------------------------------------------------
 
+    async def _load_user_name(self) -> str:
+        for filename in ("user_profile.md", "user_summary.md"):
+            try:
+                content = await self.capability_worker.read_file(
+                    filename, in_ability_directory=False
+                )
+                if content:
+                    name = self.capability_worker.text_to_text_response(
+                        f"Extract the person's first name from this profile text. "
+                        f"Return only the name, or UNKNOWN if not found.\n{content}"
+                    ).strip()
+                    if name and name != "UNKNOWN":
+                        return name
+            except Exception:
+                pass
+        return ""
+
     async def _handle_setup(self, data: dict) -> dict:
-        await self.capability_worker.speak(
-            "Hi! I'm your sleep tracker. I'll learn your sleep patterns over time "
-            "and give you personalised insights — not generic advice, but findings "
-            "from your own data. What's your name?"
-        )
-        name_reply = await self.capability_worker.user_response()
-        if not name_reply:
-            await self.capability_worker.speak("Come back whenever you're ready. Sleep well!")
-            return data
+        name = await self._load_user_name()
+        if not name:
+            await self.capability_worker.speak(
+                "Hi! I'm your sleep tracker. I'll learn your sleep patterns over time "
+                "and give you personalised insights — not generic advice, but findings "
+                "from your own data. What's your name?"
+            )
+            name_reply = await self.capability_worker.user_response()
+            if not name_reply:
+                await self.capability_worker.speak("Come back whenever you're ready. Sleep well!")
+                return data
+            name = name_reply.strip().split()[0].capitalize()
 
-        name = name_reply.strip().split()[0].capitalize()
-
         await self.capability_worker.speak(
-            f"Nice to meet you, {name}. How many hours of sleep do you aim for each night?"
+            f"How many hours of sleep do you aim for each night, {name}?"
+            if name else
+            "How many hours of sleep do you aim for each night?"
         )
         goal_reply = await self.capability_worker.user_response()
         goal = self._extract_hours(goal_reply or "8")
@@ -176,7 +196,7 @@ class SleepQualityTrackerCapability(MatchingCapability):
         self._save_data(data)
 
         await self.capability_worker.speak(
-            f"Perfect. I'll aim to help you hit {goal:.0f} hours a night, {name}. "
+            f"Perfect. I'll aim to help you hit {goal:.0f} hours a night. "
             f"Each morning, just say 'how did I sleep' and I'll log it. "
             f"After a week I'll start spotting patterns in your data. Let's go."
         )
@@ -197,28 +217,29 @@ class SleepQualityTrackerCapability(MatchingCapability):
             return
 
         await self.capability_worker.speak(
-            f"Morning{', ' + name if name else ''}! How many hours did you sleep?"
+            f"Morning{', ' + name if name else ''}! How'd you sleep?"
         )
-        hours_reply = await self.capability_worker.user_response()
-        if not hours_reply or self._is_exit(hours_reply):
+        sleep_reply = await self.capability_worker.user_response()
+        if not sleep_reply or self._is_exit(sleep_reply):
             await self.capability_worker.speak("No worries — log it whenever you're ready.")
             return
-        hours = self._extract_hours(hours_reply)
 
-        await self.capability_worker.speak("And how do you feel — 1 to 10?")
-        quality_reply = await self.capability_worker.user_response()
-        if not quality_reply or self._is_exit(quality_reply):
-            quality = 5
-        else:
-            quality = self._extract_rating(quality_reply)
+        hours = self._extract_hours(sleep_reply)
+        quality = self._extract_rating(sleep_reply)
+        notes = self.capability_worker.text_to_text_response(
+            f"Extract any sleep note or comment from this text (e.g. 'woke up in the night', "
+            f"'vivid dreams', 'felt groggy'). Return the note as a short phrase, "
+            f"or NONE if nothing noteworthy was mentioned. Text: \"{sleep_reply}\""
+        ).strip()
+        if notes.upper() == "NONE":
+            notes = ""
 
-        await self.capability_worker.speak(
-            "Anything to note? Woke up in the night, vivid dreams, anything? Say 'nothing' to skip."
-        )
-        notes_reply = await self.capability_worker.user_response()
-        notes = ""
-        if notes_reply and not self._is_exit(notes_reply):
-            notes = notes_reply.strip()
+        # If hours could not be extracted from the natural reply, ask once
+        if hours == 7.0 and "7" not in sleep_reply and "seven" not in sleep_reply.lower():
+            await self.capability_worker.speak("How many hours roughly?")
+            hours_reply = await self.capability_worker.user_response()
+            if hours_reply and not self._is_exit(hours_reply):
+                hours = self._extract_hours(hours_reply)
 
         entry = {
             "date": self._today_str(),
