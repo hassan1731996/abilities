@@ -16,7 +16,8 @@ HOTWORDS = [
     "renewals tracker", "life admin tracker",
 ]
 
-EXIT_WORDS = {"stop", "done", "exit", "quit", "bye", "cancel", "nothing", "thats", "all"}
+EXIT_WORDS = {"stop", "done", "exit", "quit", "bye", "cancel", "nothing"}
+EXIT_PHRASES = {"that's all", "thats all", "no thanks"}
 
 INTENT_PROMPT = (
     "Classify the user's intent for a Life Admin and Renewals tracker.\n"
@@ -116,7 +117,10 @@ class LifeAdminTrackerCapability(MatchingCapability):
     # ------------------------------------------------------------------
 
     def _is_exit(self, text: str) -> bool:
-        tokens = set(text.lower().strip().split())
+        text_lower = text.lower().strip()
+        if any(p in text_lower for p in EXIT_PHRASES):
+            return True
+        tokens = set(text_lower.split())
         return bool(tokens & EXIT_WORDS)
 
     def _today(self) -> str:
@@ -207,23 +211,41 @@ class LifeAdminTrackerCapability(MatchingCapability):
     # Setup
     # ------------------------------------------------------------------
 
+    async def _load_user_name(self) -> str:
+        for filename in ("user_profile.md", "user_summary.md"):
+            try:
+                content = await self.capability_worker.read_file(
+                    filename, in_ability_directory=False
+                )
+                if content:
+                    name = self.capability_worker.text_to_text_response(
+                        f"Extract the person's first name from this profile text. "
+                        f"Return only the name, or UNKNOWN if not found.\n{content}"
+                    ).strip()
+                    if name and name != "UNKNOWN":
+                        return name
+            except Exception:
+                pass
+        return ""
+
     async def _handle_setup(self, data: dict) -> dict:
-        await self.capability_worker.speak(
-            "Hi! I'm your Life Admin tracker. I'll keep on top of your renewals and "
-            "expiry dates and remind you automatically before anything's due. "
-            "What's your name?"
-        )
-        reply = await self.capability_worker.user_response()
-        name = ""
-        if reply:
-            name = self.capability_worker.text_to_text_response(
-                NAME_EXTRACT_PROMPT.format(text=reply)
-            ).strip()
+        name = await self._load_user_name()
+        if not name:
+            await self.capability_worker.speak(
+                "Hi! I'm your Life Admin tracker. I'll keep on top of your renewals and "
+                "expiry dates and remind you automatically before anything's due. "
+                "What's your name?"
+            )
+            reply = await self.capability_worker.user_response()
+            if reply:
+                name = self.capability_worker.text_to_text_response(
+                    NAME_EXTRACT_PROMPT.format(text=reply)
+                ).strip()
         data["user_name"] = name
         data["setup_complete"] = True
         data["items"] = []
         self._save_data(data)
-        greeting = f"Great, {name}!" if name else "Great!"
+        greeting = f"Got it, {name}!" if name else "Got it!"
         await self.capability_worker.speak(
             f"{greeting} Say 'add a renewal' to start tracking something, "
             f"or 'what's due soon' any time to check your list."
