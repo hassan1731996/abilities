@@ -54,8 +54,8 @@ templates/
 ├── music-template/        ← Stream a track; branch on how playback ended.
 │
 ├── SendEmail/             ← Fire-and-forget SDK method call.
-├── Local/                 ← LLM as translator; execute on local machine.
-├── OpenClaw/              ← Escape the sandbox via OpenClaw.
+├── openhome-local-link/   ← Voice → shell command on your PC via `openhome local`.
+├── openclaw/              ← Desktop automation via OpenClaw, over `openhome local`.
 ├── smart-home/            ← Voice-control MQTT devices; LLM picks the device + command.
 ├── PhilipsHueLightControl/← Local + persistent BLE daemon. Real hardware example.
 ├── devkit_led_lights_control/ ← Local + onboard NeoPixel LED ring control.
@@ -114,15 +114,15 @@ Every Skill **must** call this when done. It hands control back to the agent's n
 
 ---
 
-#### [`Local`](./templates/Local) — LLM as Translator (Mac Terminal)
+#### [`openhome-local-link`](./openhome-local-link) — LLM as Translator (Terminal)
 **Type:** Skill · **Pattern:** LLM-as-translator · **Complexity:** Medium
 
-You say `"list all my Python files"` and the speaker translates that into a real terminal command (`find . -name "*.py"`), runs it on your local machine, and reads back the result in plain English. Two LLM calls bookend the local execution — one translates speech → command, another translates raw output → human speech.
+You say `"list all my Python files"` and the speaker translates that into a real terminal command (`find . -name "*.py"`), runs it on your machine, and reads back the result in plain English. Two LLM calls bookend the local execution — one translates speech → command, another translates raw output → human speech.
 
 **Key SDK methods:** `wait_for_complete_transcription()`, `text_to_text_response()`, `exec_local_command()`
 
 **Key pattern — `exec_local_command()`:**
-Abilities run in OpenHome's cloud sandbox, not on your local machine. `exec_local_command()` bridges that gap via WebSocket to whatever device is connected (Mac, Pi, etc.).
+Abilities run in OpenHome's cloud sandbox, not on your machine. Run the **`openhome local`** bridge (the OpenHome CLI) on your computer and `exec_local_command()` reaches it over the connection; a plain command runs on the built-in raw-shell **`local-link`** handler.
 
 > ⚠️ No command validation or safety filtering is included. A production version must guard against destructive commands (`rm -rf`) and handle long-running processes with timeouts.
 
@@ -130,24 +130,28 @@ Abilities run in OpenHome's cloud sandbox, not on your local machine. `exec_loca
 
 ---
 
-#### [`OpenClaw`](./templates/OpenClaw) — Sandbox Escape
+#### [`openclaw`](./openclaw) — Sandbox Escape
 **Type:** Skill · **Pattern:** Sandbox escape · **Complexity:** Minimal
 
-Forwards the user's raw speech directly to OpenClaw — a desktop AI agent with 2,800+ community skills. OpenClaw processes it on your local machine and returns the result. The speaker becomes a voice interface for your entire desktop.
+Forwards the user's raw speech to OpenClaw — a desktop AI agent with 2,800+ community skills. OpenClaw processes it on your machine and returns the result. The speaker becomes a voice interface for your entire desktop.
 
-OpenHome abilities run in a restricted cloud sandbox — no arbitrary Python packages, no local network calls, limited filesystem access. OpenClaw is the escape hatch.
+OpenHome abilities run in a restricted cloud sandbox — no arbitrary Python packages, no local network calls, limited filesystem access. The **`openhome local`** bridge is the escape hatch: run it on your computer (with OpenClaw installed), and requests reach OpenClaw through its built-in **`openclaw`** handler.
 
 **Key SDK methods:** `wait_for_complete_transcription()`, `exec_local_command()`, `speak()`
 
 ```python
+import json
 user_inquiry = await self.capability_worker.wait_for_complete_transcription()
-await self.capability_worker.speak("Sending inquiry to OpenClaw")
-response = await self.capability_worker.exec_local_command(user_inquiry)
-await self.capability_worker.speak(response["data"])
+await self.capability_worker.speak("Sending your request to OpenClaw.")
+# Target the `openclaw` handler on the bridge (a plain string runs on `local-link`):
+payload = {"type": "command", "target": "openclaw", "data": user_inquiry}
+raw = await self.capability_worker.exec_local_command(json.dumps(payload), timeout=60.0)
+data = raw.get("data") if isinstance(raw, dict) and raw.get("type") == "response" else raw
+await self.capability_worker.speak(data.get("data") if isinstance(data, dict) else str(data))
 self.capability_worker.resume_normal_flow()
 ```
 
-> No routing logic, error handling, or timeout handling is included. A real implementation would parse the response structure and handle unmatched skills gracefully.
+> Add error handling and a confirmation step for destructive tasks before relying on it.
 
 **Build on top:** smart home hub via HomeAssistant, code execution, app control (`"Open Spotify"`), multi-agent orchestration for complex workflows.
 
@@ -279,8 +283,8 @@ self.capability_worker.write_file("state.json", json.dumps(data))
 | `basic-template` | Skill | `speak()`, `resume_normal_flow()` |
 | `api-template` | Skill | `text_to_text_response()`, `resume_normal_flow()` |
 | `SendEmail` | Skill | `send_email()`, `speak()`, `resume_normal_flow()` |
-| `Local` | Skill | `text_to_text_response()`, `exec_local_command()` |
-| `OpenClaw` | Skill | `exec_local_command()`, `speak()` |
+| `openhome-local-link` | Skill | `text_to_text_response()`, `exec_local_command()` (via `openhome local`) |
+| `openclaw` | Skill | `exec_local_command()` → `openclaw` handler (via `openhome local`) |
 | `smart-home` | Skill | `text_to_text_response()`, `send_devkit_mqtt_action()`, `speak()` |
 | `PhilipsHueLightControl` | Local | `send_devkit_capability_action()`, `text_to_text_response()`, `speak()` |
 | `devkit_led_lights_control` | Local | `send_devkit_capability_action()`, `send_devkit_action()`, `text_to_text_response()` |
