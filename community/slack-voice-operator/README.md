@@ -14,42 +14,16 @@ A voice-first Slack companion for OpenHome. Read and summarise channel activity,
 
 ## Setup
 
-### 1. Create a Slack App
+### 1. Link Your Slack Account
 
-1. Go to [api.slack.com/apps](https://api.slack.com/apps) → **Create New App** → **From scratch**
-2. Choose your workspace
+1. Go to [OpenHome Dashboard → Settings](https://app.openhome.com/dashboard/settings)
+2. Link your Slack account
 
-### 2. Add OAuth Scopes
+That's it. No bot app to create, no scopes to configure, no token to copy. The platform handles OAuth and provides the token to the ability at runtime via `get_slack_key()`.
 
-Under **OAuth & Permissions → Bot Token Scopes**, add:
+### 2. First Voice Run
 
-| Scope | Purpose |
-|-------|---------|
-| `channels:history` | Read public channel messages |
-| `channels:read` | List public channels |
-| `groups:history` | Read private channel messages |
-| `groups:read` | List private channels |
-| `im:history` | Read direct messages |
-| `im:read` | List direct message conversations |
-| `chat:write` | Send messages |
-| `users:read` | Look up workspace members |
-
-### 3. Install & Get Token
-
-1. **Install to Workspace** (button on the OAuth page)
-2. Copy the **Bot User OAuth Token** (`xoxb-...`)
-3. In OpenHome platform settings, add a key: `slack_bot_token` = your token
-
-### 4. Invite the Bot to Channels
-
-In each Slack channel you want the ability to read, type:
-```
-/invite @your-bot-name
-```
-
-### 5. First Voice Run
-
-Say any trigger phrase — the ability walks you through a one-time setup: finding your user ID by display name, picking channels to watch for background mention alerts.
+Say any trigger phrase — the ability connects automatically, confirms the workspace name, and asks which channels to watch for background mention alerts.
 
 ## Trigger Phrases
 
@@ -94,5 +68,4 @@ All data is persisted in context storage under key `slack_voice_operator`:
 
 - The background daemon polls every 10 minutes. It only interrupts for @mentions, never for general channel activity.
 - `users.list` fetches up to 200 members. For large workspaces, name matching uses the most common names. If a name isn't found, try the exact Slack display name.
-- The bot must be **invited** to each channel (`/invite @bot`) — it cannot read channels it's not a member of.
-- This ability uses a **Bot Token** (`xoxb-`). User tokens (`xoxp-`) also work if you prefer to send messages as yourself.
+- Channels are fetched from your linked account — you'll only see channels you're already a member of.

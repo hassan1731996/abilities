@@ -1,13 +1,14 @@
 import json
-import requests
 from datetime import datetime, timezone
+
+from slack_sdk import WebClient
+from slack_sdk.errors import SlackApiError
 
 from src.agent.capability import MatchingCapability
 from src.agent.capability_worker import CapabilityWorker
 from src.main import AgentWorker
 
 STORAGE_KEY = "slack_voice_operator"
-SLACK_API = "https://slack.com/api"
 
 HOTWORDS = {
     "check my slack", "slack update", "slack messages", "open slack",
@@ -29,6 +30,7 @@ INTENTS = {"MENTIONS", "SUMMARY", "SEND", "CHANNELS", "SETUP", "EXIT"}
 class SlackVoiceOperator(MatchingCapability):
     worker: AgentWorker = None
     capability_worker: CapabilityWorker = None
+    slack_client: WebClient = None
 
     # Do not change following tag of register capability
     # {{register capability}}
@@ -46,40 +48,41 @@ class SlackVoiceOperator(MatchingCapability):
         try:
             trigger = await self.capability_worker.wait_for_complete_transcription()
 
-            token = self.capability_worker.get_api_keys("slack_bot_token") or ""
+            token = self.capability_worker.get_slack_key() or ""
             if not token:
                 await self.capability_worker.speak(
-                    "I need a Slack bot token to get started. "
-                    "Create a Slack app at api dot slack dot com, add the required scopes, "
-                    "install it to your workspace, then save the bot token in OpenHome settings as slack underscore bot underscore token."
+                    "Your Slack account isn't linked yet. "
+                    "Go to app dot openhome dot com, open Settings, and link your Slack account to get started."
                 )
                 return
+
+            self.slack_client = WebClient(token=token)
 
             config = self._load_config()
             fresh_setup = not (config and config.get("slack_user_id"))
 
             if fresh_setup:
-                config = await self._handle_setup(config or {}, token)
+                config = await self._handle_setup(config or {})
                 if not config:
                     return
             else:
                 if trigger and not self._is_exit(trigger):
-                    intent = self._classify_intent(trigger, config)
+                    intent = self._classify_intent(trigger)
                     if intent == "EXIT":
                         await self.capability_worker.speak("Sure, I'll let you know if anything important comes in.")
                         return
-                    await self._dispatch(intent, trigger, config, token)
+                    await self._dispatch(intent, trigger, config)
 
             while True:
                 reply = await self.capability_worker.user_response()
                 if not reply or self._is_exit(reply):
                     await self.capability_worker.speak("Got it. I'll ping you if any important mentions come in.")
                     break
-                intent = self._classify_intent(reply, config)
+                intent = self._classify_intent(reply)
                 if intent == "EXIT":
                     await self.capability_worker.speak("Got it. I'll ping you if any important mentions come in.")
                     break
-                await self._dispatch(intent, reply, config, token)
+                await self._dispatch(intent, reply, config)
 
         except Exception as e:
             self.worker.editor_logging_handler.error(f"[SlackVoiceOperator] Error: {e}")
@@ -88,7 +91,7 @@ class SlackVoiceOperator(MatchingCapability):
 
     # ── Setup ──────────────────────────────────────────────────────────────
 
-    async def _handle_setup(self, config: dict, token: str) -> dict:
+    async def _handle_setup(self, config: dict) -> dict:
         user_name = await self._load_user_name()
         if not user_name:
             await self.capability_worker.speak("What's your name?")
@@ -99,36 +102,30 @@ class SlackVoiceOperator(MatchingCapability):
                 ).strip()
         config["user_name"] = user_name
 
+        try:
+            auth = self.slack_client.auth_test()
+            config["slack_user_id"] = auth["user_id"]
+            workspace = auth.get("team", "your workspace")
+        except SlackApiError as e:
+            await self.capability_worker.speak(
+                "I couldn't connect to Slack. "
+                "Check that your account is properly linked in OpenHome settings."
+            )
+            self.worker.editor_logging_handler.error(f"[SlackVoiceOperator] auth_test: {e}")
+            return None
+
         greeting = f"Hi {user_name}! " if user_name else ""
         await self.capability_worker.speak(
-            f"{greeting}Let me connect to your Slack. "
-            "What's your display name — the name shown on your Slack profile?"
+            f"{greeting}Connected to {workspace}. Let me fetch your channels."
         )
-        name_reply = await self.capability_worker.user_response()
-        if not name_reply:
-            await self.capability_worker.speak("I didn't catch that. Try saying 'open Slack' to start again.")
-            return None
 
-        await self.capability_worker.speak("One moment while I look you up.")
-        users = self._fetch_users(token)
-        matched_user = self._fuzzy_match_user(name_reply, users)
-        if not matched_user:
-            await self.capability_worker.speak(
-                f"I couldn't find anyone named {name_reply} in your workspace. "
-                "Make sure the name matches your Slack profile exactly, then try again."
-            )
-            return None
-
-        config["slack_user_id"] = matched_user["id"]
-        config["user_cache"] = users
-
-        channels = self._fetch_all_channels(token)
+        channels = self._fetch_all_channels()
         config["channel_cache"] = channels
 
         if not channels:
             await self.capability_worker.speak(
                 "I connected to Slack but couldn't find any channels. "
-                "Make sure the bot is invited to at least one channel, then try again."
+                "Make sure you're a member of at least one channel, then try again."
             )
             return None
 
@@ -162,17 +159,17 @@ class SlackVoiceOperator(MatchingCapability):
 
     # ── Intent dispatch ────────────────────────────────────────────────────
 
-    async def _dispatch(self, intent: str, utterance: str, config: dict, token: str):
+    async def _dispatch(self, intent: str, utterance: str, config: dict):
         if intent == "MENTIONS":
-            await self._handle_mentions(config, token)
+            await self._handle_mentions(config)
         elif intent == "SUMMARY":
-            await self._handle_summary(utterance, config, token)
+            await self._handle_summary(utterance, config)
         elif intent == "SEND":
-            await self._handle_send(utterance, config, token)
+            await self._handle_send(utterance, config)
         elif intent == "CHANNELS":
-            await self._handle_channels(config, token)
+            await self._handle_channels(config)
         elif intent == "SETUP":
-            updated = await self._handle_setup(config, token)
+            updated = await self._handle_setup(config)
             if updated:
                 config.update(updated)
         else:
@@ -182,7 +179,7 @@ class SlackVoiceOperator(MatchingCapability):
 
     # ── Mentions ───────────────────────────────────────────────────────────
 
-    async def _handle_mentions(self, config: dict, token: str):
+    async def _handle_mentions(self, config: dict):
         user_id = config.get("slack_user_id", "")
         watch_channels = config.get("watch_channels", [])
         channel_cache = config.get("channel_cache", [])
@@ -196,16 +193,18 @@ class SlackVoiceOperator(MatchingCapability):
         lookback = str(datetime.now(timezone.utc).timestamp() - 86400)
         mentions = []
         for ch_id in watch_channels:
-            result = self._slack_api("conversations.history", token, params={
-                "channel": ch_id, "oldest": lookback, "limit": 50
-            })
-            if not result.get("ok"):
+            try:
+                result = self.slack_client.conversations_history(
+                    channel=ch_id, oldest=lookback, limit=50
+                )
+                for msg in result["messages"]:
+                    text = msg.get("text", "")
+                    if f"<@{user_id}>" in text:
+                        ch_name = next((c["name"] for c in channel_cache if c["id"] == ch_id), ch_id)
+                        mentions.append({"channel": ch_name, "text": text})
+            except SlackApiError as e:
+                self.worker.editor_logging_handler.error(f"[SlackVoiceOperator] history {ch_id}: {e}")
                 continue
-            for msg in result.get("messages", []):
-                text = msg.get("text", "")
-                if f"<@{user_id}>" in text:
-                    ch_name = next((c["name"] for c in channel_cache if c["id"] == ch_id), ch_id)
-                    mentions.append({"channel": ch_name, "text": text})
 
         if not mentions:
             await self.capability_worker.speak("No mentions in the last 24 hours. You're all clear.")
@@ -224,17 +223,17 @@ class SlackVoiceOperator(MatchingCapability):
 
     # ── Summary ────────────────────────────────────────────────────────────
 
-    async def _handle_summary(self, utterance: str, config: dict, token: str):
+    async def _handle_summary(self, utterance: str, config: dict):
         channels = config.get("channel_cache", [])
         if not channels:
             await self.capability_worker.speak("Let me refresh your channel list first.")
-            channels = self._fetch_all_channels(token)
+            channels = self._fetch_all_channels()
             config["channel_cache"] = channels
             self._save_config(config)
 
         if not channels:
             await self.capability_worker.speak(
-                "I couldn't find any channels. Check that your bot is invited to at least one channel."
+                "I couldn't find any channels. Check that your Slack account is properly linked."
             )
             return
 
@@ -259,19 +258,17 @@ class SlackVoiceOperator(MatchingCapability):
             )
             return
 
-        result = self._slack_api("conversations.history", token, params={
-            "channel": channel["id"], "limit": 25
-        })
-        if not result.get("ok"):
-            err = result.get("error", "unknown")
+        try:
+            result = self.slack_client.conversations_history(channel=channel["id"], limit=25)
+            messages = [m for m in result["messages"] if m.get("text")]
+        except SlackApiError as e:
             await self.capability_worker.speak(
                 f"I couldn't read #{channel['name']}. "
-                "Make sure the bot is invited to that channel."
+                "Make sure you're a member of that channel."
             )
-            self.worker.editor_logging_handler.error(f"[SlackVoiceOperator] history error: {err}")
+            self.worker.editor_logging_handler.error(f"[SlackVoiceOperator] history: {e}")
             return
 
-        messages = [m for m in result.get("messages", []) if m.get("text")]
         if not messages:
             await self.capability_worker.speak(f"#{channel['name']} has been quiet — no recent messages.")
             return
@@ -286,7 +283,7 @@ class SlackVoiceOperator(MatchingCapability):
 
     # ── Send ───────────────────────────────────────────────────────────────
 
-    async def _handle_send(self, utterance: str, config: dict, token: str):
+    async def _handle_send(self, utterance: str, config: dict):
         channels = config.get("channel_cache", [])
 
         extracted = self.capability_worker.text_to_text_response(
@@ -336,7 +333,7 @@ class SlackVoiceOperator(MatchingCapability):
         else:
             user_cache = config.get("user_cache") or []
             if not user_cache:
-                user_cache = self._fetch_users(token)
+                user_cache = self._fetch_users()
                 config["user_cache"] = user_cache
                 self._save_config(config)
             matched_user = self._fuzzy_match_user(recipient, user_cache)
@@ -358,27 +355,24 @@ class SlackVoiceOperator(MatchingCapability):
             await self.capability_worker.speak("Message cancelled.")
             return
 
-        result = self._slack_api("chat.postMessage", token, method="POST", json_body={
-            "channel": target_id,
-            "text": message,
-        })
-        if result.get("ok"):
+        try:
+            self.slack_client.chat_postMessage(channel=target_id, text=message)
             await self.capability_worker.speak("Sent.")
-        else:
-            err = result.get("error", "unknown error")
+        except SlackApiError as e:
+            err = e.response.get("error", "unknown error")
             await self.capability_worker.speak(f"Couldn't send the message: {err}.")
-            self.worker.editor_logging_handler.error(f"[SlackVoiceOperator] postMessage error: {err}")
+            self.worker.editor_logging_handler.error(f"[SlackVoiceOperator] postMessage: {e}")
 
     # ── Channels ───────────────────────────────────────────────────────────
 
-    async def _handle_channels(self, config: dict, token: str):
-        channels = self._fetch_all_channels(token)
+    async def _handle_channels(self, config: dict):
+        channels = self._fetch_all_channels()
         if channels:
             config["channel_cache"] = channels
             self._save_config(config)
 
         if not channels:
-            await self.capability_worker.speak("I couldn't retrieve your channel list. Check that your bot token is valid.")
+            await self.capability_worker.speak("I couldn't retrieve your channel list. Check that your Slack account is linked.")
             return
 
         names = ", ".join(f"#{c['name']}" for c in channels[:10])
@@ -389,7 +383,7 @@ class SlackVoiceOperator(MatchingCapability):
 
     # ── Helpers ────────────────────────────────────────────────────────────
 
-    def _classify_intent(self, text: str, config: dict) -> str:
+    def _classify_intent(self, text: str) -> str:
         result = self.capability_worker.text_to_text_response(
             "Classify this Slack assistant request. Return ONLY one label.\n"
             "MENTIONS = checking @mentions or pings\n"
@@ -423,43 +417,32 @@ class SlackVoiceOperator(MatchingCapability):
                 pass
         return ""
 
-    def _slack_api(self, endpoint: str, token: str, params: dict = None,
-                   json_body: dict = None, method: str = "GET") -> dict:
-        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-        url = f"{SLACK_API}/{endpoint}"
+    def _fetch_all_channels(self) -> list:
         try:
-            if method == "POST":
-                resp = requests.post(url, headers=headers, json=json_body, timeout=10)
-            else:
-                resp = requests.get(url, headers=headers, params=params, timeout=10)
-            return resp.json()
-        except Exception as e:
-            self.worker.editor_logging_handler.error(f"[SlackVoiceOperator] API {endpoint}: {e}")
-            return {}
+            result = self.slack_client.conversations_list(
+                types="public_channel,private_channel",
+                exclude_archived=True,
+                limit=200,
+            )
+            return [{"id": c["id"], "name": c["name"]} for c in result["channels"]]
+        except SlackApiError as e:
+            self.worker.editor_logging_handler.error(f"[SlackVoiceOperator] conversations_list: {e}")
+            return []
 
-    def _fetch_all_channels(self, token: str) -> list:
-        result = self._slack_api("conversations.list", token, params={
-            "types": "public_channel,private_channel",
-            "exclude_archived": "true",
-            "limit": 200,
-        })
-        return [{"id": c["id"], "name": c["name"]} for c in result.get("channels", [])]
-
-    def _fetch_users(self, token: str) -> list:
-        result = self._slack_api("users.list", token, params={"limit": 200})
-        return [
-            {
-                "id": m["id"],
-                "name": m.get("profile", {}).get("real_name") or m.get("name", ""),
-            }
-            for m in result.get("members", [])
-            if not m.get("is_bot") and not m.get("deleted")
-        ]
-
-    def _resolve_user_id_by_name(self, display_name: str, token: str) -> str:
-        users = self._fetch_users(token)
-        matched = self._fuzzy_match_user(display_name, users)
-        return matched["id"] if matched else ""
+    def _fetch_users(self) -> list:
+        try:
+            result = self.slack_client.users_list(limit=200)
+            return [
+                {
+                    "id": m["id"],
+                    "name": m.get("profile", {}).get("real_name") or m.get("name", ""),
+                }
+                for m in result["members"]
+                if not m.get("is_bot") and not m.get("deleted")
+            ]
+        except SlackApiError as e:
+            self.worker.editor_logging_handler.error(f"[SlackVoiceOperator] users_list: {e}")
+            return []
 
     def _fuzzy_match_channel(self, query: str, channels: list) -> dict:
         query = query.lower().strip().lstrip("#")
