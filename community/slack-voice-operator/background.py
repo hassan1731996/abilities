@@ -1,12 +1,13 @@
-import requests
 from datetime import datetime, timezone
+
+from slack_sdk import WebClient
+from slack_sdk.errors import SlackApiError
 
 from src.agent.capability import MatchingCapability
 from src.agent.capability_worker import CapabilityWorker
 from src.main import AgentWorker
 
 STORAGE_KEY = "slack_voice_operator"
-SLACK_API = "https://slack.com/api"
 POLL_INTERVAL = 600.0
 ERROR_SLEEP = 120.0
 
@@ -40,7 +41,7 @@ class SlackMentionMonitor(MatchingCapability):
             await self.worker.session_tasks.sleep(POLL_INTERVAL)
 
     async def _poll_mentions(self):
-        token = self.capability_worker.get_api_keys("slack_bot_token") or ""
+        token = self.capability_worker.get_slack_key() or ""
         if not token:
             return
 
@@ -56,27 +57,30 @@ class SlackMentionMonitor(MatchingCapability):
         if not watch_channels:
             return
 
+        slack_client = WebClient(token=token)
         mentions = []
+
         for ch_id in watch_channels:
-            result = self._slack_api("conversations.history", token, params={
-                "channel": ch_id,
-                "oldest": last_ts,
-                "limit": 50,
-            })
-            if not result.get("ok"):
+            try:
+                result = slack_client.conversations_history(
+                    channel=ch_id,
+                    oldest=last_ts,
+                    limit=50,
+                )
+                for msg in result["messages"]:
+                    text = msg.get("text", "")
+                    if f"<@{user_id}>" in text:
+                        ch_name = next((c["name"] for c in channel_cache if c["id"] == ch_id), ch_id)
+                        mentions.append({
+                            "channel": ch_name,
+                            "text": text,
+                            "ts": msg.get("ts", "0"),
+                        })
+            except SlackApiError as e:
                 self.worker.editor_logging_handler.warning(
-                    f"[SlackMonitor] history error for {ch_id}: {result.get('error', 'unknown')}"
+                    f"[SlackMonitor] history error for {ch_id}: {e.response.get('error', 'unknown')}"
                 )
                 continue
-            for msg in result.get("messages", []):
-                text = msg.get("text", "")
-                if f"<@{user_id}>" in text:
-                    ch_name = next((c["name"] for c in channel_cache if c["id"] == ch_id), ch_id)
-                    mentions.append({
-                        "channel": ch_name,
-                        "text": text,
-                        "ts": msg.get("ts", "0"),
-                    })
 
         if not mentions:
             return
@@ -113,17 +117,3 @@ class SlackMentionMonitor(MatchingCapability):
 
         await self.capability_worker.send_interrupt_signal()
         await self.capability_worker.speak(spoken)
-
-    def _slack_api(self, endpoint: str, token: str, params: dict = None,
-                   json_body: dict = None, method: str = "GET") -> dict:
-        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-        url = f"{SLACK_API}/{endpoint}"
-        try:
-            if method == "POST":
-                resp = requests.post(url, headers=headers, json=json_body, timeout=10)
-            else:
-                resp = requests.get(url, headers=headers, params=params, timeout=10)
-            return resp.json()
-        except Exception as e:
-            self.worker.editor_logging_handler.error(f"[SlackMonitor] API {endpoint}: {e}")
-            return {}
