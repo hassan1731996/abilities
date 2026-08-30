@@ -1,5 +1,4 @@
 import re
-import requests
 from datetime import datetime, timedelta
 
 from src.agent.capability import MatchingCapability
@@ -177,7 +176,7 @@ class WikiDeepDive(MatchingCapability):
     def _fetch_topic(self, topic: str) -> tuple:
         formatted = topic.strip().replace(" ", "_")
         try:
-            resp = requests.get(
+            resp = self.worker.session_tasks.get(
                 WIKI_SUMMARY_URL + formatted,
                 headers=WIKI_HEADERS,
                 timeout=6,
@@ -202,7 +201,7 @@ class WikiDeepDive(MatchingCapability):
 
     def _fetch_full_text(self, topic: str) -> str:
         try:
-            resp = requests.get(
+            resp = self.worker.session_tasks.get(
                 WIKI_FULL_URL,
                 params={
                     "action": "query",
@@ -225,7 +224,7 @@ class WikiDeepDive(MatchingCapability):
 
     def _search_suggestions(self, topic: str) -> list:
         try:
-            resp = requests.get(
+            resp = self.worker.session_tasks.get(
                 WIKI_FULL_URL,
                 params={
                     "action": "opensearch",
@@ -326,19 +325,15 @@ class WikiDeepDive(MatchingCapability):
             "timestamp": datetime.now().strftime("%Y-%m-%d"),
         }
         try:
-            existing = self.capability_worker.get_single_key(STORAGE_KEY)
-            if existing:
+            result = self.capability_worker.create_key(STORAGE_KEY, {"sessions": [entry]})
+            if not result.get("success"):
+                existing = self.capability_worker.get_single_key(STORAGE_KEY) or {}
                 sessions = existing.get("sessions", [])
                 sessions = [s for s in sessions if s.get("topic") != topic]
                 sessions.insert(0, entry)
                 self.capability_worker.update_key(STORAGE_KEY, {"sessions": sessions[:5]})
-            else:
-                self.capability_worker.create_key(STORAGE_KEY, {"sessions": [entry]})
-        except Exception:
-            try:
-                self.capability_worker.update_key(STORAGE_KEY, {"sessions": [entry]})
-            except Exception as e:
-                self.worker.editor_logging_handler.error(f"[WikiDeepDive] save error: {e}")
+        except Exception as e:
+            self.worker.editor_logging_handler.error(f"[WikiDeepDive] save error: {e!r}")
 
     def _get_recent_session(self) -> dict:
         try:
