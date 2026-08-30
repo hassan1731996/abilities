@@ -88,7 +88,7 @@ class WikiDeepDive(MatchingCapability):
                         return
                     topic = self._extract_topic(utterance) or utterance.strip()
 
-            await self.capability_worker.speak(f"Looking that up.")
+            await self.capability_worker.speak("Looking that up.")
             summary, full_text = self._fetch_topic(topic)
             if not summary:
                 await self._handle_not_found(topic)
