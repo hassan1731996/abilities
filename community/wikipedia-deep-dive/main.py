@@ -11,6 +11,11 @@ WIKI_HEADERS = {
     "User-Agent": "OpenHome-WikiDeepDive/1.0 (https://github.com/openhome-dev/abilities)"
 }
 
+# Phrases this ability recognizes as the start of a topic, e.g. "learn about black
+# holes". Used only to strip the spoken phrase and isolate the topic in
+# _extract_topic() below -- actual triggering is the dashboard's job (trigger words
+# are configured there, not in code), so this list has no does_match() of its own to
+# keep in sync with the dashboard.
 HOTWORDS = {
     "learn about", "deep dive", "deep-dive",
     "teach me about", "wikipedia", "deep dive into",
@@ -53,10 +58,6 @@ class WikiDeepDive(MatchingCapability):
 
     # Do not change following tag of register capability
     # {{register capability}}
-
-    def does_match(self, text: str) -> bool:
-        t = text.lower()
-        return any(hw in t for hw in HOTWORDS)
 
     def call(self, worker: AgentWorker):
         self.worker = worker
