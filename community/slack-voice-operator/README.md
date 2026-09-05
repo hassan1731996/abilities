@@ -19,7 +19,7 @@ A voice-first Slack companion for OpenHome. Read and summarise channel activity,
 1. Go to [OpenHome Dashboard → Settings](https://app.openhome.com/dashboard/settings)
 2. Link your Slack account
 
-That's it. No bot app to create, no scopes to configure, no token to copy. The platform handles OAuth and provides the token to the ability at runtime via `get_slack_key()`.
+That's it. No bot app to create, no scopes to configure, no token to copy. The platform handles OAuth and provides the token to the ability at runtime.
 
 ### 2. First Voice Run
 
@@ -64,8 +64,20 @@ All data is persisted in context storage under key `slack_voice_operator`:
 - `user_cache` — workspace member list for name resolution
 - `last_mention_ts` — timestamp of the last processed @mention
 
+## How this differs from the Slack Assistant template
+
+OpenHome ships a basic `slack-assistant` template. Slack Voice Operator goes further in three ways:
+
+| Capability | Slack Assistant template | Slack Voice Operator |
+|---|---|---|
+| Session type | Single-intent, one-shot | Multi-intent conversation loop |
+| Background monitoring | None | Daemon polls every 10 min, urgency-scored |
+| API pagination | No (first page only) | Full cursor-based pagination for channels, users, history |
+| LLM summaries | No | All responses condensed by LLM before speaking |
+| Name resolution | Exact handle required | Fuzzy-matched against full member list |
+
 ## Notes
 
 - The background daemon polls every 10 minutes. It only interrupts for @mentions, never for general channel activity.
-- `users.list` fetches up to 200 members. For large workspaces, name matching uses the most common names. If a name isn't found, try the exact Slack display name.
+- Channel and user lists are fully paginated — works with large workspaces.
 - Channels are fetched from your linked account — you'll only see channels you're already a member of.

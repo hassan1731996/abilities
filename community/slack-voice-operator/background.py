@@ -1,5 +1,3 @@
-from datetime import datetime, timezone
-
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
@@ -30,7 +28,6 @@ class SlackMentionMonitor(MatchingCapability):
         self.worker.session_tasks.create(self.watch_loop())
 
     async def watch_loop(self):
-        self.capability_worker.resume_normal_flow()
         while True:
             try:
                 await self._poll_mentions()
@@ -41,11 +38,12 @@ class SlackMentionMonitor(MatchingCapability):
             await self.worker.session_tasks.sleep(POLL_INTERVAL)
 
     async def _poll_mentions(self):
-        token = self.capability_worker.get_slack_key() or ""
+        token = self.capability_worker.get_token("slack") or ""
         if not token:
             return
 
-        stored = self.capability_worker.get_single_key(STORAGE_KEY)
+        raw = self.capability_worker.get_single_key(STORAGE_KEY)
+        stored = raw.get("value", raw) if raw else {}
         if not stored or not stored.get("slack_user_id"):
             return
 
@@ -88,7 +86,9 @@ class SlackMentionMonitor(MatchingCapability):
         latest_ts = max(m["ts"] for m in mentions)
         stored["last_mention_ts"] = latest_ts
         try:
-            self.capability_worker.update_key(STORAGE_KEY, stored)
+            result = self.capability_worker.create_key(STORAGE_KEY, stored)
+            if not result.get("success"):
+                self.capability_worker.update_key(STORAGE_KEY, stored)
         except Exception as e:
             self.worker.editor_logging_handler.error(f"[SlackMonitor] Timestamp save error: {e!r}")
 

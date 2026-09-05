@@ -48,7 +48,7 @@ class SlackVoiceOperator(MatchingCapability):
         try:
             trigger = await self.capability_worker.wait_for_complete_transcription()
 
-            token = self.capability_worker.get_slack_key() or ""
+            token = self.capability_worker.get_token("slack") or ""
             if not token:
                 await self.capability_worker.speak(
                     "Your Slack account isn't linked yet. "
@@ -97,9 +97,11 @@ class SlackVoiceOperator(MatchingCapability):
             await self.capability_worker.speak("What's your name?")
             reply = await self.capability_worker.user_response()
             if reply:
-                user_name = self.capability_worker.text_to_text_response(
+                user_name = (self.capability_worker.text_to_text_response(
                     f"Extract the first name from: '{reply}'. Return only the name."
-                ).strip()
+                ) or "").strip()
+                if len(user_name) > 50:
+                    user_name = ""
         config["user_name"] = user_name
 
         try:
@@ -139,7 +141,7 @@ class SlackVoiceOperator(MatchingCapability):
         )
         watch_reply = await self.capability_worker.user_response()
         if not watch_reply or "all" in (watch_reply or "").lower():
-            watch = channels[:10]
+            watch = channels
         else:
             watch = self._match_channels_from_utterance(watch_reply, channels)
             if not watch:
@@ -194,14 +196,20 @@ class SlackVoiceOperator(MatchingCapability):
         mentions = []
         for ch_id in watch_channels:
             try:
-                result = self.slack_client.conversations_history(
-                    channel=ch_id, oldest=lookback, limit=50
-                )
-                for msg in result["messages"]:
-                    text = msg.get("text", "")
-                    if f"<@{user_id}>" in text:
-                        ch_name = next((c["name"] for c in channel_cache if c["id"] == ch_id), ch_id)
-                        mentions.append({"channel": ch_name, "text": text})
+                cursor = None
+                for _ in range(3):
+                    kwargs = {"channel": ch_id, "oldest": lookback, "limit": 50}
+                    if cursor:
+                        kwargs["cursor"] = cursor
+                    result = self.slack_client.conversations_history(**kwargs)
+                    for msg in result["messages"]:
+                        text = msg.get("text", "")
+                        if f"<@{user_id}>" in text:
+                            ch_name = next((c["name"] for c in channel_cache if c["id"] == ch_id), ch_id)
+                            mentions.append({"channel": ch_name, "text": text})
+                    cursor = result.get("response_metadata", {}).get("next_cursor")
+                    if not cursor:
+                        break
             except SlackApiError as e:
                 self.worker.editor_logging_handler.error(f"[SlackVoiceOperator] history {ch_id}: {e}")
                 continue
@@ -238,13 +246,13 @@ class SlackVoiceOperator(MatchingCapability):
             return
 
         channel_list = ", ".join(c["name"] for c in channels)
-        target_name = self.capability_worker.text_to_text_response(
+        target_name = (self.capability_worker.text_to_text_response(
             f"From this request: '{utterance}', identify which Slack channel the user wants to summarize. "
             f"Available channels: {channel_list}. "
             f"Return only the exact channel name from the list, or NONE if not mentioned."
-        ).strip().lower().lstrip("#")
+        ) or "").strip().lower().lstrip("#")
 
-        if target_name == "none" or not target_name:
+        if not target_name or target_name == "none" or len(target_name) > 80:
             await self.capability_worker.speak("Which channel would you like me to summarize?")
             reply = await self.capability_worker.user_response()
             if not reply:
@@ -259,8 +267,17 @@ class SlackVoiceOperator(MatchingCapability):
             return
 
         try:
-            result = self.slack_client.conversations_history(channel=channel["id"], limit=25)
-            messages = [m for m in result["messages"] if m.get("text")]
+            messages = []
+            cursor = None
+            for _ in range(3):
+                kwargs = {"channel": channel["id"], "limit": 50}
+                if cursor:
+                    kwargs["cursor"] = cursor
+                result = self.slack_client.conversations_history(**kwargs)
+                messages.extend(m for m in result["messages"] if m.get("text"))
+                cursor = result.get("response_metadata", {}).get("next_cursor")
+                if not cursor or len(messages) >= 100:
+                    break
         except SlackApiError as e:
             await self.capability_worker.speak(
                 f"I couldn't read #{channel['name']}. "
@@ -286,15 +303,15 @@ class SlackVoiceOperator(MatchingCapability):
     async def _handle_send(self, utterance: str, config: dict):
         channels = config.get("channel_cache", [])
 
-        extracted = self.capability_worker.text_to_text_response(
+        extracted = (self.capability_worker.text_to_text_response(
             f"From this request, extract the Slack recipient and the message to send. "
             f"Recipient can be a person's name or a channel (e.g. #general). "
             f"Return JSON only — no markdown: {{\"recipient\": \"...\", \"message\": \"...\"}}\n"
             f"Request: {utterance}"
-        ).strip()
+        ) or "").strip()
 
         try:
-            parsed = json.loads(extracted)
+            parsed = json.loads(extracted) if extracted else {}
             recipient = parsed.get("recipient", "").strip()
             message = parsed.get("message", "").strip()
         except Exception:
@@ -372,7 +389,9 @@ class SlackVoiceOperator(MatchingCapability):
             self._save_config(config)
 
         if not channels:
-            await self.capability_worker.speak("I couldn't retrieve your channel list. Check that your Slack account is linked.")
+            await self.capability_worker.speak(
+                "I couldn't retrieve your channel list. Check that your Slack account is linked."
+            )
             return
 
         names = ", ".join(f"#{c['name']}" for c in channels[:10])
@@ -418,31 +437,49 @@ class SlackVoiceOperator(MatchingCapability):
         return ""
 
     def _fetch_all_channels(self) -> list:
+        channels = []
+        cursor = None
         try:
-            result = self.slack_client.conversations_list(
-                types="public_channel,private_channel",
-                exclude_archived=True,
-                limit=200,
-            )
-            return [{"id": c["id"], "name": c["name"]} for c in result["channels"]]
+            while True:
+                kwargs = {
+                    "types": "public_channel,private_channel",
+                    "exclude_archived": True,
+                    "limit": 200,
+                }
+                if cursor:
+                    kwargs["cursor"] = cursor
+                result = self.slack_client.conversations_list(**kwargs)
+                channels.extend({"id": c["id"], "name": c["name"]} for c in result["channels"])
+                cursor = result.get("response_metadata", {}).get("next_cursor")
+                if not cursor:
+                    break
         except SlackApiError as e:
             self.worker.editor_logging_handler.error(f"[SlackVoiceOperator] conversations_list: {e}")
-            return []
+        return channels
 
     def _fetch_users(self) -> list:
+        users = []
+        cursor = None
         try:
-            result = self.slack_client.users_list(limit=200)
-            return [
-                {
-                    "id": m["id"],
-                    "name": m.get("profile", {}).get("real_name") or m.get("name", ""),
-                }
-                for m in result["members"]
-                if not m.get("is_bot") and not m.get("deleted")
-            ]
+            while True:
+                kwargs = {"limit": 200}
+                if cursor:
+                    kwargs["cursor"] = cursor
+                result = self.slack_client.users_list(**kwargs)
+                users.extend(
+                    {
+                        "id": m["id"],
+                        "name": m.get("profile", {}).get("real_name") or m.get("name", ""),
+                    }
+                    for m in result["members"]
+                    if not m.get("is_bot") and not m.get("deleted")
+                )
+                cursor = result.get("response_metadata", {}).get("next_cursor")
+                if not cursor:
+                    break
         except SlackApiError as e:
             self.worker.editor_logging_handler.error(f"[SlackVoiceOperator] users_list: {e}")
-            return []
+        return users
 
     def _fuzzy_match_channel(self, query: str, channels: list) -> dict:
         query = query.lower().strip().lstrip("#")
@@ -454,13 +491,14 @@ class SlackVoiceOperator(MatchingCapability):
                 return c
         if channels:
             name_list = ", ".join(c["name"] for c in channels)
-            best = self.capability_worker.text_to_text_response(
+            best = (self.capability_worker.text_to_text_response(
                 f"Match '{query}' to the closest channel from: {name_list}. "
                 f"Return only the exact channel name, or NONE."
-            ).strip().lower()
-            for c in channels:
-                if c["name"].lower() == best:
-                    return c
+            ) or "").strip().lower()
+            if best and best != "none":
+                for c in channels:
+                    if c["name"].lower() == best:
+                        return c
         return None
 
     def _fuzzy_match_user(self, query: str, users: list) -> dict:
@@ -473,36 +511,38 @@ class SlackVoiceOperator(MatchingCapability):
                 return u
         if users:
             name_list = ", ".join(u["name"] for u in users[:60])
-            best = self.capability_worker.text_to_text_response(
+            best = (self.capability_worker.text_to_text_response(
                 f"Match '{query}' to the closest person from: {name_list}. "
                 f"Return only the exact name, or NONE."
-            ).strip()
-            for u in users:
-                if u["name"].lower() == best.lower():
-                    return u
+            ) or "").strip()
+            if best and best.upper() != "NONE":
+                for u in users:
+                    if u["name"].lower() == best.lower():
+                        return u
         return None
 
     def _match_channels_from_utterance(self, utterance: str, channels: list) -> list:
         name_list = ", ".join(c["name"] for c in channels)
-        result = self.capability_worker.text_to_text_response(
+        result = (self.capability_worker.text_to_text_response(
             f"From this request: '{utterance}', extract all channel names the user wants to watch. "
             f"Match against: {name_list}. "
             f"Return a comma-separated list of exact channel names, or NONE."
-        ).strip()
-        if result.upper() == "NONE":
+        ) or "").strip()
+        if not result or result.upper() == "NONE":
             return []
         selected = {n.strip().lstrip("#").lower() for n in result.split(",")}
         return [c for c in channels if c["name"].lower() in selected]
 
     def _load_config(self) -> dict:
         stored = self.capability_worker.get_single_key(STORAGE_KEY)
-        return stored if stored else {}
+        if not stored:
+            return {}
+        return stored.get("value", stored)
 
     def _save_config(self, config: dict):
         try:
-            self.capability_worker.create_key(STORAGE_KEY, config)
-        except Exception:
-            try:
+            result = self.capability_worker.create_key(STORAGE_KEY, config)
+            if not result.get("success"):
                 self.capability_worker.update_key(STORAGE_KEY, config)
-            except Exception as e:
-                self.worker.editor_logging_handler.error(f"[SlackVoiceOperator] Save error: {e!r}")
+        except Exception as e:
+            self.worker.editor_logging_handler.error(f"[SlackVoiceOperator] Save error: {e!r}")
