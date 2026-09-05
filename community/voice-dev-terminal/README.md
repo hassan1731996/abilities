@@ -7,13 +7,21 @@ A voice-native developer terminal for OpenHome. Say "terminal", then keep talkin
 
 ## What Makes It Different
 
-| | Alexa / Siri | `openhome-local-link` template | Voice Dev Terminal |
+The closest existing templates are **`openhome-local-link`**, **`openclaw`**, and **`hermes`** — each solves a different problem:
+
+| | `openhome-local-link` | `openclaw` / `hermes` | Voice Dev Terminal |
 |---|---|---|---|
-| Session | One command, done | One command, done | Stays open for multiple commands |
-| Command source | Fixed set | LLM one-shot | LLM with full conversation history |
-| Output | Raw or none | Raw string spoken back | LLM-summarized into natural speech |
-| Dangerous commands | No guard | No guard | Voice confirmation required |
+| Mechanism | `exec_local_command` (shell) | WebSocket → persistent agent process | `exec_local_command` (shell) |
+| Session | One command, exits | One-shot delegation | Stays open for multiple commands |
+| Requires extra software | No | Yes (OpenClaw / Hermes agent running) | No |
+| Command source | LLM one-shot | Delegated to agent | LLM with full conversation history |
+| Output | Raw string spoken back | Agent's reply | LLM-summarized into natural speech |
+| Dangerous commands | No guard | Handled by agent | Voice confirmation required |
 | Inline trigger | No | No | "terminal, git status" runs immediately |
+
+**OpenClaw and Hermes** connect to persistent agent processes running on your machine via WebSocket — they're delegation layers for agent-based workflows. Voice Dev Terminal is an ad-hoc interactive shell session: no persistent process needed, just the Local Link bridge.
+
+**`openhome-local-link`** is the closest comparator. It runs one command and exits. Voice Dev Terminal keeps the session open, maintains conversation history across commands (so "do it again but verbose" works), and adds a danger-token confirmation step before running destructive commands.
 
 ## Trigger Phrases
 
