@@ -339,14 +339,14 @@ class KidsMathDuel(MatchingCapability):
         entry["best_streak"] = max(entry.get("best_streak", 0), best_streak)
         data[name] = entry
 
-        result = self.capability_worker.create_key(STORAGE_KEY, data)
-        if not (result or {}).get("success"):
-            try:
+        try:
+            result = self.capability_worker.create_key(STORAGE_KEY, data)
+            if not (result or {}).get("success"):
                 self.capability_worker.update_key(STORAGE_KEY, data)
-            except Exception as e:
-                self.worker.editor_logging_handler.error(
-                    f"[KidsMathDuel] Leaderboard save error: {e!r}"
-                )
+        except Exception as e:
+            self.worker.editor_logging_handler.error(
+                f"[KidsMathDuel] Leaderboard save error: {e!r}"
+            )
 
     # ------------------------------------------------------------------
     # Exit detection — two-tier (exact match for short words, substring for phrases)
