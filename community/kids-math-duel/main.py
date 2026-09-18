@@ -1,3 +1,4 @@
+import asyncio
 import random
 import re
 
@@ -42,6 +43,7 @@ class KidsMathDuel(MatchingCapability):
     _timed_out: bool = False
     _timer_epoch: int = 0
     _current_opponent: str = ""
+    _exit_requested: bool = False
 
     def does_match(self, text: str) -> bool:
         t = text.lower()
@@ -86,6 +88,9 @@ class KidsMathDuel(MatchingCapability):
 
             while True:
                 scores, best_streaks = await self._run_game(p1, p2, difficulty)
+                if self._exit_requested:
+                    await self.capability_worker.speak("Okay, bye!")
+                    return
                 await self._announce_result(p1, p2, scores, best_streaks, difficulty)
                 self._update_leaderboard(p1, scores[p1], best_streaks[p1])
                 self._update_leaderboard(p2, scores[p2], best_streaks[p2])
@@ -172,6 +177,8 @@ class KidsMathDuel(MatchingCapability):
             question, correct = self._generate_question(difficulty)
 
             got_it = await self._ask_with_timer(player, question, correct, opponent)
+            if self._exit_requested:
+                break
 
             if got_it:
                 scores[player] += 1
@@ -187,6 +194,9 @@ class KidsMathDuel(MatchingCapability):
                 streaks[player] = 0
                 await self.capability_worker.speak(f"{opponent} — steal it! {question}")
                 steal_input = (await self.capability_worker.user_response() or "").strip()
+                if self._is_exit(steal_input):
+                    self._exit_requested = True
+                    break
 
                 if self._check_answer(steal_input, correct):
                     scores[opponent] += 1
@@ -217,14 +227,30 @@ class KidsMathDuel(MatchingCapability):
         epoch = self._timer_epoch
 
         await self.capability_worker.speak(f"{player} — {question}")
-        self.worker.session_tasks.create(self._countdown(TIMER_SECONDS, epoch))
 
-        user_input = (await self.capability_worker.user_response() or "").strip()
+        # Race the listen against the timer rather than awaiting it alone - a
+        # silent player used to leave this call (and the whole ability) hanging
+        # forever, since "Time's up!" spoke but nothing ever unblocked the
+        # listen. Whichever finishes first wins; the other is cancelled.
+        listen_task = self.worker.session_tasks.create(self.capability_worker.user_response())
+        timer_task = self.worker.session_tasks.create(self._countdown(TIMER_SECONDS, epoch))
+        done, _ = await asyncio.wait(
+            {listen_task, timer_task}, return_when=asyncio.FIRST_COMPLETED
+        )
         self._answered = True
 
-        if self._timed_out:
-            return False
-        return self._check_answer(user_input, correct)
+        if listen_task in done:
+            timer_task.cancel()
+            user_input = (listen_task.result() or "").strip()
+            if self._is_exit(user_input):
+                self._exit_requested = True
+                return False
+            return self._check_answer(user_input, correct)
+
+        # Timer fired first - let "Time's up!" finish, then hand off.
+        await timer_task
+        listen_task.cancel()
+        return False
 
     async def _countdown(self, seconds: int, epoch: int):
         await self.worker.session_tasks.sleep(float(seconds))
