@@ -15,7 +15,6 @@ env/
 .venv/
 
 # IDE
-.vscode/
 .idea/
 *.swp
 *.swo
@@ -53,3 +52,4 @@ temp_interactive_push.bat
 
 # Fonts (generated/local)
 public/fonts/
+.gitignore
