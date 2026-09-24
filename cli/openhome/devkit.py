@@ -10,9 +10,11 @@ import asyncio
 import contextlib
 import json
 import os
+import re
 import subprocess
 import sys
-from dataclasses import dataclass, field
+import time
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable
 
 from bleak import BleakClient, BleakScanner
@@ -71,6 +73,85 @@ def _is_devkit(name: str) -> bool:
     return name.strip().lower().startswith(DEVICE_PREFIX)
 
 
+# ── tracing (`openhome devkit … --verbose`) ─────────────────────────────
+_CHAR_NAMES = {
+    WIFI_SCAN_UUID: "wifi-scan",
+    WIFI_CONNECT_UUID: "wifi-connect",
+    WIFI_STATUS_UUID: "wifi-status",
+    API_KEY_UUID: "api-key",
+    HEARTBEAT_UUID: "heartbeat",
+    ENV_CONFIG_UUID: "env-config",
+    "7772e5db-3868-4112-a1a9-f2669d106bf3": "MIDI I/O",
+}
+_SERVICE_NAMES = {
+    SERVICE_UUID: "openhome-setup",
+    "03b80e5a-ede8-4b33-a751-6ce34ec4c700": "BLE MIDI",
+}
+_SECRET_FIELDS = ("password", "api_key")
+_trace_sink: Callable[[str], None] | None = None
+_trace_start = 0.0
+
+
+def enable_trace(sink: Callable[[str], None] | None) -> None:
+    """Send a timestamped log of every Bluetooth and network exchange to ``sink``."""
+    global _trace_sink, _trace_start
+    _trace_sink = sink
+    _trace_start = time.monotonic()
+
+
+def _trace(message: str) -> None:
+    # Wall-clock time lines the trace up with the DevKit's journal and btmon;
+    # the elapsed time makes gaps easy to read.
+    if _trace_sink is not None:
+        now = time.time()
+        clock = time.strftime("%H:%M:%S", time.localtime(now)) + f".{int(now % 1 * 1000):03d}"
+        _trace_sink(f"[{clock} +{time.monotonic() - _trace_start:7.3f}s] {message}")
+
+
+def _since(started: float) -> str:
+    return f"{(time.monotonic() - started) * 1000:.0f} ms"
+
+
+def _char(uuid: Any) -> str:
+    return _CHAR_NAMES.get(str(uuid).lower(), str(uuid))
+
+
+def _trace_services(client: Any) -> None:
+    """List the DevKit's GATT services and characteristics in the trace."""
+    if _trace_sink is None:
+        return
+    for svc in sorted(client.services or [], key=lambda sv: sv.handle):
+        label = _SERVICE_NAMES.get(str(svc.uuid).lower(), svc.description)
+        _trace(f"  service 0x{svc.handle:04x} {svc.uuid}  {label}")
+        for ch in sorted(svc.characteristics, key=lambda c: c.handle):
+            name = _CHAR_NAMES.get(str(ch.uuid).lower(), ch.description)
+            _trace(f"    char  0x{ch.handle:04x} {ch.uuid}  {name}  [{', '.join(ch.properties)}]")
+
+
+_SECRET_VALUE = re.compile(r'("(?:password|api_key)"\s*:\s*")((?:[^"\\]|\\.)*)(")')
+
+
+def _size(raw: bytes) -> str:
+    return "1 byte" if len(raw) == 1 else f"{len(raw)} bytes"
+
+
+def _show(data: Any) -> str:
+    """A payload exactly as sent or received: its size and raw text.
+
+    Secret values are overwritten with ``*`` in place, so the size and layout
+    stay exactly as they were on the wire. Non-text payloads are shown as hex.
+    """
+    raw = bytes(data)
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return f"({_size(raw)}) hex {raw.hex(' ')}"
+    if not text.isprintable():
+        return f"({_size(raw)}) hex {raw.hex(' ')}"
+    text = _SECRET_VALUE.sub(lambda m: m.group(1) + "*" * len(m.group(2)) + m.group(3), text)
+    return f"({_size(raw)}) {text}"
+
+
 # ── value types ─────────────────────────────────────────────────────────
 @dataclass(frozen=True)
 class Device:
@@ -85,6 +166,7 @@ class Network:
     signal: int = 0
     security: str = ""
     bssid: str = ""
+    connected: bool = False  # the network the DevKit is on (newer firmware only)
 
     @property
     def is_open(self) -> bool:
@@ -98,6 +180,7 @@ class WifiStatus:
     reason: str = ""          # "invalid_password" | "failed"
     reverted: bool = False    # firmware rolled back to the previous network
     reverted_ssid: str = ""
+    ssid: str = ""            # network it is on, when the firmware says
 
     @property
     def is_connected(self) -> bool:
@@ -107,9 +190,14 @@ class WifiStatus:
     def is_final(self) -> bool:
         return self.state.lower() in ("connected", "error", "failed")
 
+    @property
+    def is_wrong_password(self) -> bool:
+        # Decided by the typed `reason` only; `message` is free text for logs.
+        return self.reason == "invalid_password"
+
     def explain(self, ssid: str) -> str:
         # Our own wording: the firmware's messages are for its logs, not users.
-        if self.reason == "invalid_password":
+        if self.is_wrong_password:
             text = f"Wrong password for {ssid!r}."
         else:
             # The firmware often can't tell a bad password from other join
@@ -285,7 +373,9 @@ async def pairing_agent():
         ).get_interface("org.bluez.AgentManager1")
         await manager.call_register_agent(_AGENT_PATH, "NoInputNoOutput")
         await manager.call_request_default_agent(_AGENT_PATH)
-    except Exception:  # any D-Bus failure: carry on without an agent
+        _trace("pairing agent registered")
+    except Exception as exc:  # any D-Bus failure: carry on without an agent
+        _trace(f"pairing agent unavailable: {exc}")
         if bus is not None:
             with contextlib.suppress(Exception):
                 bus.disconnect()
@@ -322,6 +412,7 @@ async def scan_devices(
         if strict and not _is_devkit(name):
             return
         found[device.address] = Device(name or "(unnamed)", device.address, adv.rssi)
+        _trace(f"scan: found {name or '(unnamed)'} {device.address} rssi={adv.rssi}")
         note(f"found {name or 'a DevKit'}")
         if strict and settle_deadline is None:
             # Give any sibling DevKits a moment to show up before we stop.
@@ -376,10 +467,18 @@ class DevKit:
         last: Exception | None = None
         for attempt in range(1, attempts + 1):
             try:
-                client = BleakClient(self.address, timeout=CONNECT_TIMEOUT)
+                client = BleakClient(
+                    self.address, timeout=CONNECT_TIMEOUT,
+                    disconnected_callback=lambda _c: _trace("link: disconnected"),
+                )
+                _trace(f"connect: attempt {attempt}/{attempts} to {self.address}")
+                started = time.monotonic()
                 with _ble_errors("connecting"):
                     # bleak honours its own timeout; this is a backstop.
                     await asyncio.wait_for(client.connect(), timeout=CONNECT_TIMEOUT + 5)
+                _trace(f"connect: connected in {_since(started)}, "
+                       f"{len(list(client.services or []))} services")
+                _trace_services(client)
                 self._client = client
                 if not self._has_service():
                     # BlueZ can report "connected" over a stale record or the
@@ -393,6 +492,7 @@ class DevKit:
                 return
             except (ConnectionLost, DeviceNotFound, DevKitError) as exc:
                 last = exc
+                _trace(f"connect: attempt {attempt} failed: {exc.__cause__ or exc}")
                 if attempt < attempts:
                     delay = min(4.0, 1.0 * 1.6 ** (attempt - 1))
                     self._note(f"still trying to connect ({attempt + 1}/{attempts})…")
@@ -432,10 +532,14 @@ class DevKit:
 
     async def _write(self, client: Any, uuid: str, payload: bytes, what: str) -> None:
         """Write a characteristic; a write that never completes counts as a lost link."""
+        _trace(f"TX  write  {_char(uuid)}: {_show(payload)}")
+        started = time.monotonic()
         with _ble_errors(what):
             try:
                 await asyncio.wait_for(client.write_gatt_char(uuid, payload), timeout=WRITE_TIMEOUT)
+                _trace(f"    acked  {_char(uuid)} in {_since(started)}")
             except asyncio.TimeoutError as exc:
+                _trace(f"    no ack {_char(uuid)} after {_since(started)}")
                 raise ConnectionLost(
                     "The DevKit didn't respond in time." + _detail(what, exc)
                 ) from exc
@@ -457,6 +561,17 @@ class DevKit:
         finally:
             self._note = note
 
+    async def _ensure_link(self) -> None:
+        """Reconnect if the link has dropped since the last step. Newer firmware
+        disconnects on purpose once a WiFi scan's notifications are stopped."""
+        if not self.is_connected:
+            _trace("link: down before this step; reconnecting")
+            try:
+                await self.reconnect()
+            except DevKitError as exc:
+                # Surface it as a lost link so callers can offer a retry.
+                raise ConnectionLost("Lost the connection to the DevKit.") from exc
+
     def _need_link(self) -> Any:
         if not self.is_connected:
             raise ConnectionLost("Lost the connection to the DevKit.")
@@ -467,7 +582,10 @@ class DevKit:
         # is perfectly healthy.
         with contextlib.suppress(Exception):
             await asyncio.wait_for(
-                self._client.start_notify(HEARTBEAT_UUID, lambda *_a: None), timeout=OP_TIMEOUT
+                self._client.start_notify(
+                    HEARTBEAT_UUID, lambda _s, data: _trace(f"RX  notify heartbeat: {_show(data)}")
+                ),
+                timeout=OP_TIMEOUT,
             )
 
     @contextlib.asynccontextmanager
@@ -475,18 +593,27 @@ class DevKit:
         """Subscribe for the duration of a block. Unsubscribing never raises."""
         client = self._need_link()
         subscribed = False
+
+        def traced(sender, data) -> None:
+            _trace(f"RX  notify {_char(uuid)}: {_show(data)}")
+            handler(sender, data)
+
+        started = time.monotonic()
         try:
             with _ble_errors("subscribing to updates"):
-                await asyncio.wait_for(client.start_notify(uuid, handler), timeout=OP_TIMEOUT)
+                await asyncio.wait_for(client.start_notify(uuid, traced), timeout=OP_TIMEOUT)
             subscribed = True
-        except DevKitError:
-            pass  # subscribing can fail on its own; callers decide what that means
+            _trace(f"subscribed {_char(uuid)} in {_since(started)}")
+        except DevKitError as exc:
+            # Subscribing can fail on its own; callers decide what that means.
+            _trace(f"subscribe {_char(uuid)} failed: {exc.__cause__ or exc}")
         try:
             yield subscribed
         finally:
             if subscribed:
                 with contextlib.suppress(Exception):
                     await asyncio.wait_for(client.stop_notify(uuid), timeout=OP_TIMEOUT)
+                _trace(f"unsubscribed {_char(uuid)}")
 
     # -- wifi scan -------------------------------------------------------
     async def scan_networks(self, timeout: float = NETWORK_SCAN_TIMEOUT) -> list[Network]:
@@ -505,15 +632,7 @@ class DevKit:
             if status in ("initiated", "scanning"):
                 networks.clear()  # the device restarted the list
             elif status == "network":
-                net = msg.get("network") or {}
-                networks.append(
-                    Network(
-                        ssid=str(net.get("ssid") or ""),
-                        signal=int(net.get("signal") or 0),
-                        security=str(net.get("security") or ""),
-                        bssid=str(net.get("bssid") or ""),
-                    )
-                )
+                networks.append(_network(msg.get("network") or {}))
                 total = msg.get("total") or 0
                 self._note(f"  {len(networks)}/{total} {networks[-1].ssid}")
             elif status == "complete":
@@ -543,10 +662,16 @@ class DevKit:
     # -- wifi status / join ----------------------------------------------
     async def _read_json(self, uuid: str, what: str) -> dict[str, Any]:
         client = self._need_link()
-        with _ble_errors(what):
-            raw = await asyncio.wait_for(
-                client.read_gatt_char(uuid), timeout=READ_TIMEOUT
-            )
+        started = time.monotonic()
+        try:
+            with _ble_errors(what):
+                raw = await asyncio.wait_for(
+                    client.read_gatt_char(uuid), timeout=READ_TIMEOUT
+                )
+        except DevKitError as exc:
+            _trace(f"RX  read   {_char(uuid)} failed after {_since(started)}: {exc.__cause__ or exc}")
+            raise
+        _trace(f"RX  read   {_char(uuid)} in {_since(started)}: {_show(raw)}")
         return _decode(raw, what)
 
     async def wifi_status(self) -> WifiStatus:
@@ -560,6 +685,7 @@ class DevKit:
         Raises WifiFailed if the DevKit reports a failure, and returns None if no
         verdict arrives within ``timeout``.
         """
+        await self._ensure_link()
         client = self._need_link()
         done = asyncio.Event()
         latest: list[WifiStatus] = []
@@ -568,22 +694,29 @@ class DevKit:
         armed = False  # seen this attempt's "connecting" state
 
         def belongs_here(status: WifiStatus) -> bool:
-            # The DevKit keeps its last verdict between attempts, so a result
-            # counts only if it names this network and follows this attempt's
-            # "connecting" (which the firmware reports first, within seconds).
-            if status.message and ssid.lower() not in status.message.lower():
+            # The DevKit keeps its last verdict between attempts and pushes its
+            # current state as soon as we subscribe, so a final state only
+            # counts once the credentials have been sent, and once this
+            # attempt has reported "connecting" (the firmware's first step) -
+            # or long enough after sending that it must have. The message text
+            # is not used: its wording differs between firmware versions.
+            if not written_at:
                 return False
             return armed or (loop.time() - written_at) >= 3.0
 
         def consider(status: WifiStatus) -> bool:
             nonlocal armed
+            waited = f"{loop.time() - written_at:.1f}s" if written_at else "before send"
             if not status.is_final:
-                if status.state.lower() == "connecting":
+                if status.state.lower() == "connecting" and not armed:
                     armed = True
+                    _trace(f"join: DevKit started connecting ({waited} after send)")
                 return False
             if belongs_here(status):
                 latest.append(status)
+                _trace(f"join: verdict '{status.state}' accepted ({waited} after send)")
                 return True
+            _trace(f"join: ignored '{status.state}' as left over from an earlier attempt")
             return False
 
         def handler(_sender, data) -> None:
@@ -599,6 +732,7 @@ class DevKit:
             # A failure here means the write never landed, which is a real error.
             await self._write(client, WIFI_CONNECT_UUID, payload, "sending WiFi credentials")
             written_at = loop.time()
+            _trace(f"join: waiting up to {timeout:.0f}s for the DevKit's verdict")
 
             deadline = written_at + timeout
             while not done.is_set() and loop.time() < deadline:
@@ -606,8 +740,10 @@ class DevKit:
                     await asyncio.wait_for(done.wait(), timeout=2.0)
                 if done.is_set():
                     break
+                _trace(f"join: nothing yet at {loop.time() - written_at:.1f}s; checking status")
                 if not self.is_connected:
                     # Joining WiFi can drop the link; the verdict survives it.
+                    _trace("join: link is down; reconnecting to fetch the verdict")
                     try:
                         await self.reconnect()
                     except DevKitError:
@@ -620,11 +756,13 @@ class DevKit:
                     break
 
         status = latest[-1] if latest else None
+        _trace(f"join: finished after {loop.time() - written_at:.1f}s -> "
+               f"{status.state if status else 'no verdict'}")
         if status is None:
             return None
         if status.is_connected:
             return status
-        raise WifiFailed(status.explain(ssid))
+        raise WifiFailed(status.explain(ssid), wrong_password=status.is_wrong_password)
 
     # -- api key ---------------------------------------------------------
     async def api_key_status(self) -> ApiKeyStatus:
@@ -640,6 +778,7 @@ class DevKit:
         Raises ApiKeyRejected if the DevKit refuses it, and returns None if no
         verdict arrives within ``timeout``.
         """
+        await self._ensure_link()
         client = self._need_link()
         done = asyncio.Event()
         latest: list[ApiKeyStatus] = []
@@ -686,6 +825,7 @@ def _wifi_status(msg: dict[str, Any]) -> WifiStatus:
         reason=str(msg.get("reason") or ""),
         reverted=bool(msg.get("reverted")),
         reverted_ssid=str(msg.get("reverted_ssid") or ""),
+        ssid=str(msg.get("ssid") or ""),
     )
 
 
@@ -698,16 +838,41 @@ def _api_key_status(msg: dict[str, Any]) -> ApiKeyStatus:
     )
 
 
+def _network(net: dict[str, Any]) -> Network:
+    """One scan entry. Older firmware sends `signal` as a percentage, newer
+    firmware `signal_dbm` (a percentage too, or real dBm when negative)."""
+    raw = net.get("signal", net.get("signal_dbm"))
+    try:
+        signal = int(float(raw or 0))
+    except (TypeError, ValueError):
+        signal = 0
+    if signal < 0:  # dBm: -100 (none) .. -50 (excellent)
+        signal = 2 * (signal + 100)
+    return Network(
+        ssid=str(net.get("ssid") or ""),
+        signal=max(0, min(100, signal)),
+        security=str(net.get("security") or ""),
+        bssid=str(net.get("bssid") or ""),
+        connected=bool(net.get("is_connected")),
+    )
+
+
 def _tidy(networks: list[Network]) -> list[Network]:
     """Drop hidden SSIDs, keep the strongest BSSID per SSID, strongest first."""
     best: dict[str, Network] = {}
+    connected: set[str] = set()
     for net in networks:
         if not net.ssid.strip():
             continue
+        if net.connected:
+            connected.add(net.ssid)
         current = best.get(net.ssid)
         if current is None or net.signal > current.signal:
             best[net.ssid] = net
-    return sorted(best.values(), key=lambda n: n.signal, reverse=True)
+    return sorted(
+        (replace(n, connected=n.ssid in connected) for n in best.values()),
+        key=lambda n: n.signal, reverse=True,
+    )
 
 
 # ── cloud health ────────────────────────────────────────────────────────
@@ -728,8 +893,11 @@ async def cloud_status(
 
     url = f"{cfg.ws_base}{devkit_socket(cfg.api_key)}"
     status = CloudStatus(detail="Your DevKit isn't online right now.")
+    started = time.monotonic()
+    _trace(f"status: connecting to {cfg.ws_base}{devkit_socket('<api key>')}")
     try:
         async with websockets.connect(url, open_timeout=timeout) as ws:
+            _trace(f"status: connected in {_since(started)}; requesting device stats")
             await ws.send("frontend")  # identify as the dashboard, not the device
             await ws.send(json.dumps({"command": "device_stats"}))
             loop = asyncio.get_running_loop()
@@ -739,7 +907,9 @@ async def cloud_status(
                 try:
                     raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
                 except asyncio.TimeoutError:
+                    _trace(f"status: no reply within {timeout:.0f}s")
                     break
+                _trace(f"status: RX {str(raw)[:160]}")
                 try:
                     msg = json.loads(raw)
                 except (TypeError, ValueError):

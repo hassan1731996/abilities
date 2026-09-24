@@ -164,10 +164,13 @@ background bridge reconnects on its own if the connection drops; `openhome local
 ```bash
 openhome devkit onboard     # set up a nearby DevKit: connect it to WiFi and sign it in
 openhome devkit status      # check whether your DevKit is online
+openhome devkit onboard --device OpenHome-XXXX   # skip the picker and use this DevKit
+openhome devkit status --watch                   # keep checking until Ctrl-C
 ```
 
 `onboard` finds your DevKit over Bluetooth, lets you pick a WiFi network and sign it
-in to your account, then confirms it's online. `status` shows whether your DevKit is
+in to your account, then confirms it's online. If a step fails, such as a wrong WiFi
+password, you can retry it right there. `status` shows whether your DevKit is
 online, along with its IP address, firmware and agent connection.
 
 ### Sync (account → local) and delete

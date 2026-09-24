@@ -680,13 +680,14 @@ def _print_key_hint(cfg) -> None:
 
 # Braille "dots" spinner frames.
 _SPIN_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+_VERBOSE = False  # set by --verbose; the spinner would redraw over trace lines
 
 
 @contextlib.asynccontextmanager
 async def _spinner(label: str):
     """Show an animated status line for the duration of a block."""
-    if not _ansi_ok():
-        # Pipes, logs, CI, and consoles that cannot redraw a line.
+    if not _ansi_ok() or _VERBOSE:
+        # Pipes, logs, CI, consoles that cannot redraw a line, and --verbose.
         print(f"  {label}…")
         yield
         return
@@ -792,7 +793,8 @@ def _print_networks(networks: list) -> None:
         filled = max(0, min(8, net.signal // 13))
         bars = "▓" * filled + "░" * (8 - filled)
         security = "open" if net.is_open else (net.security or "secured")
-        print(f"  {idx:<4}{net.ssid[:27]:<28}{bars} {net.signal:>3}%   {security}")
+        here = f"   {_dot(True)} connected" if net.connected else ""
+        print(f"  {idx:<4}{net.ssid[:27]:<28}{bars} {net.signal:>3}%   {security:<10}{here}".rstrip())
     print()
 
 
@@ -824,16 +826,6 @@ def _print_overview(status, *, device: str = "", ssid: str = "", title: str = "D
         print("  " + "    ".join(cells))
     if status.timestamp:
         print(f"  Updated   : {status.timestamp}")
-
-
-def _ssid_from(status) -> str:
-    """The firmware reports 'Connected to <ssid>'; pull the name back out."""
-    marker = "connected to "
-    text = status.message or ""
-    lowered = text.lower()
-    if lowered.startswith(marker):
-        return text[len(marker):].strip().strip("'\"")
-    return ""
 
 
 async def _devkit_read_state(kit, cfg):
@@ -892,7 +884,7 @@ def _print_devkit_state(wifi, key, signed_in: str = "") -> None:
     """Print the DevKit's current state; WiFi is shown only when the DevKit reports it."""
     print("\nCurrent state")
     if wifi.is_connected:
-        ssid = _ssid_from(wifi)
+        ssid = wifi.ssid
         print(f"  WiFi      : {_dot(True)} joined {ssid!r}" if ssid
               else f"  WiFi      : {_dot(True)} connected")
     if key.configured:
@@ -904,8 +896,17 @@ def _print_devkit_state(wifi, key, signed_in: str = "") -> None:
 # ── steps ──────────────────────────────────────────────────────────────
 async def _devkit_pick_device(devkit, args):
     """Find the DevKit to talk to, or raise DeviceNotFound."""
-    if getattr(args, "device", None):
-        return args.device
+    wanted = (getattr(args, "device", None) or "").strip()
+    if wanted:
+        print(f"Looking for {wanted}…")
+        devices = await devkit.scan_devices(timeout=args.scan_timeout, strict=False)
+        for dev in devices:
+            if wanted.lower() in (dev.name.lower(), dev.address.lower()):
+                return dev
+        raise DeviceNotFound(
+            f"Couldn't find a DevKit called {wanted!r} nearby. "
+            "Make sure it's switched on and close by."
+        )
 
     while True:
         print("Scanning for DevKits…")
@@ -951,6 +952,7 @@ async def _devkit_wifi(kit) -> str | None:
     """Put the DevKit on WiFi. Returns the SSID, or None if skipped."""
     _require_interactive("Run `openhome devkit onboard` in a terminal.")
     networks: list | None = None
+    retry = None  # network whose password was wrong; ask for it again
     while True:
         if networks is None:
             print()
@@ -971,21 +973,24 @@ async def _devkit_wifi(kit) -> str | None:
             networks = None
             continue
 
-        _print_networks(networks)
-        while True:
-            choice = (await _ask(_prompt, "  Which network? (r = rescan, q = skip)")).strip().lower()
-            if choice in ("q", "quit", "skip"):
-                return None
-            if choice in ("r", "rescan") or (
-                choice.isdigit() and 1 <= int(choice) <= len(networks)
-            ):
-                break
-            print(f"  enter a number from 1 to {len(networks)}, r or q.")
-        if choice in ("r", "rescan"):
-            networks = None
-            continue
+        if retry is not None:
+            net, retry = retry, None
+        else:
+            _print_networks(networks)
+            while True:
+                choice = (await _ask(_prompt, "  Which network? (r = rescan, q = skip)")).strip().lower()
+                if choice in ("q", "quit", "skip"):
+                    return None
+                if choice in ("r", "rescan") or (
+                    choice.isdigit() and 1 <= int(choice) <= len(networks)
+                ):
+                    break
+                print(f"  enter a number from 1 to {len(networks)}, r or q.")
+            if choice in ("r", "rescan"):
+                networks = None
+                continue
+            net = networks[int(choice) - 1]
 
-        net = networks[int(choice) - 1]
         password = ""
         if not net.is_open:
             password = await _ask(_prompt_secret, f"  Password for {net.ssid!r}")
@@ -1009,8 +1014,13 @@ async def _devkit_wifi(kit) -> str | None:
                 return None
             continue
         except WifiFailed as exc:
-            # Scan results and the link survive; back to the list.
             print(f"  ✗ {exc}")
+            if exc.wrong_password:
+                # Same network, new password; the list stays one step away.
+                if await _ask(_confirm, "  Enter the password again?"):
+                    retry = net
+                    continue
+            # Scan results and the link survive; back to the list.
             if not await _ask(_confirm, "  Try again?"):
                 return None
             continue
@@ -1192,11 +1202,11 @@ async def _devkit_onboard(args: argparse.Namespace) -> int:
 
         change_wifi = True
         if wifi_state.is_connected:
-            ssid = _ssid_from(wifi_state)
+            ssid = wifi_state.ssid or None
             change_wifi = await _ask(_confirm, "\n  Change the WiFi network?", False)
         if change_wifi:
             joined = await _devkit_wifi(kit)
-            if joined is None and not ssid:
+            if joined is None and not wifi_state.is_connected:
                 print("\nSkipped WiFi — the DevKit needs it to reach your account.")
             ssid = joined or ssid
 
@@ -1297,11 +1307,12 @@ def _restore_terminal(saved) -> None:
 
 
 def cmd_devkit(args: argparse.Namespace) -> int:
+    global _VERBOSE
     action = getattr(args, "devkit_action", None)
     if action is None:
         return _devkit_guide()
     try:
-        from . import devkit  # noqa: F401 - fail early if Bluetooth support is missing
+        from . import devkit
     except ImportError:
         # An update pulled in without reinstalling leaves `bleak` uninstalled.
         _err("Bluetooth support isn't included in this installation.")
@@ -1313,6 +1324,9 @@ def cmd_devkit(args: argparse.Namespace) -> int:
                 "  curl -fsSL https://app.openhome.com/install.sh | sh"
             )
         return 1
+    if getattr(args, "verbose", False):
+        _VERBOSE = True
+        devkit.enable_trace(lambda line: print(line, file=sys.stderr, flush=True))
     saved_tty = _save_terminal()
     try:
         if action == "onboard":
@@ -1485,9 +1499,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_dk_onboard = devkit_sub.add_parser(
         "onboard", help="Interactive Bluetooth setup (WiFi + API key)"
     )
-    p_dk_onboard.add_argument("--device", help="BLE address or name (skips discovery)")
     p_dk_onboard.add_argument(
-        "--scan-timeout", type=float, default=10.0, help="BLE discovery timeout (s)"
+        "--device", help="DevKit name or Bluetooth address to use, without asking"
+    )
+    p_dk_onboard.add_argument(
+        "--scan-timeout", type=float, default=10.0, help="seconds to scan for DevKits"
+    )
+    p_dk_onboard.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="log every Bluetooth exchange with timings (to stderr)",
     )
 
     p_dk_status = devkit_sub.add_parser(
@@ -1495,6 +1515,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_dk_status.add_argument(
         "--watch", action="store_true", help="keep polling until Ctrl-C"
+    )
+    p_dk_status.add_argument(
+        "-v", "--verbose", action="store_true", help="log the status exchange (to stderr)"
     )
 
     p_devkit.set_defaults(func=cmd_devkit)

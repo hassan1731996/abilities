@@ -47,6 +47,10 @@ class ScanFailed(DevKitError):
 class WifiFailed(DevKitError):
     """The device could not join the requested WiFi network."""
 
+    def __init__(self, message: str, *, wrong_password: bool = False) -> None:
+        super().__init__(message)
+        self.wrong_password = wrong_password
+
 
 class ApiKeyRejected(DevKitError):
     """The device (or the backend) refused the API key."""
