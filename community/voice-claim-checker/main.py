@@ -19,8 +19,9 @@ HOTWORDS = {
     "voice claim checker",
 }
 
-EXIT_WORDS = {"stop", "quit", "exit", "end", "bye", "goodbye", "done", "cancel", "no", "nope", "nah"}
+EXIT_WORDS = {"stop", "quit", "exit", "end", "bye", "goodbye", "done", "cancel"}
 EXIT_PHRASES = {"that's all", "all done", "never mind", "i'm done", "no thanks", "no more"}
+LONE_NEGATIONS = {"no", "nope", "nah"}
 
 VERDICT_LABELS = {
     "supported": "Supported",
@@ -220,10 +221,12 @@ class VoiceClaimChecker(MatchingCapability):
         if not text:
             return False
         t = text.lower().strip()
-        tokens = set(t.split())
-        if tokens & EXIT_WORDS:
+        if t in LONE_NEGATIONS:
             return True
-        return any(phrase in t for phrase in EXIT_PHRASES)
+        if any(phrase in t for phrase in EXIT_PHRASES):
+            return True
+        tokens = set(t.split())
+        return bool(tokens & EXIT_WORDS)
 
     # ── Storage ──────────────────────────────────────────────────────────────
 
@@ -247,8 +250,5 @@ class VoiceClaimChecker(MatchingCapability):
             result = self.capability_worker.create_key(STORAGE_KEY, data)
             if not (result or {}).get("success"):
                 self.capability_worker.update_key(STORAGE_KEY, data)
-        except Exception:
-            try:
-                self.capability_worker.update_key(STORAGE_KEY, data)
-            except Exception as e:
-                self.worker.editor_logging_handler.error(f"[VoiceClaimChecker] Save error: {e!r}")
+        except Exception as e:
+            self.worker.editor_logging_handler.error(f"[VoiceClaimChecker] Save error: {e!r}")
