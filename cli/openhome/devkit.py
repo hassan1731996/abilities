@@ -617,18 +617,19 @@ class DevKit:
 
     # -- wifi scan -------------------------------------------------------
     async def scan_networks(self, timeout: float = NETWORK_SCAN_TIMEOUT) -> list[Network]:
-        """Ask the DevKit to scan for WiFi; results arrive one network per notification."""
+        """Ask the DevKit to scan for WiFi; results arrive one network per notification.
+        """
         client = self._need_link()
         networks: list[Network] = []
         done = asyncio.Event()
         failure: list[str] = []
 
-        def handler(_sender, data) -> None:
-            try:
-                msg = _decode(data, "scanning for networks")
-            except DevKitError:
-                return  # a malformed frame should not abort the whole scan
+        def handle(msg: dict[str, Any]) -> None:
             status = msg.get("status")
+            listed = msg.get("networks")
+            if isinstance(listed, list):
+                # Firmware that keeps the results sends the whole list in one frame.
+                networks[:] = [_network(n) for n in listed if isinstance(n, dict)]
             if status in ("initiated", "scanning"):
                 networks.clear()  # the device restarted the list
             elif status == "network":
@@ -641,12 +642,28 @@ class DevKit:
                 failure.append(str(msg.get("message") or "the device did not say why"))
                 done.set()
 
+        def handler(_sender, data) -> None:
+            try:
+                msg = _decode(data, "scanning for networks")
+            except DevKitError:
+                return  # a malformed frame should not abort the whole scan
+            handle(msg)
+
         async with self._notifications(WIFI_SCAN_UUID, handler) as subscribed:
             if not subscribed:
                 # Results only ever arrive as notifications; without them there
                 # is nothing to wait for, so fail now rather than after 45s.
                 raise ScanFailed("The DevKit couldn't scan for WiFi networks. Please try again.")
-            await self._write(client, WIFI_SCAN_UUID, b"\x01", "starting the network scan")
+            try:
+                first = await self._read_json(WIFI_SCAN_UUID, "starting the network scan")
+            except ConnectionLost:
+                raise
+            except DevKitError:
+                first = {}  # an unreadable value is treated like any non-starting read
+            if first.get("status") not in ("initiated", "scanning"):
+                # The read did not start a scan (older firmware, which may also
+                # return the last scan's leftover state): start it with a write.
+                await self._write(client, WIFI_SCAN_UUID, b"\x01", "starting the network scan")
             with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(done.wait(), timeout=timeout)
 
