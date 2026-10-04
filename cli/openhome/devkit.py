@@ -456,6 +456,7 @@ class DevKit:
         self.name = target.name if isinstance(target, Device) else self.address
         self._note = on_progress or (lambda _m: None)
         self._client: Any = None
+        self._subscribed: set[str] = set()  # characteristics with notifications on
         self._agent = contextlib.AsyncExitStack()
 
     # -- lifecycle -------------------------------------------------------
@@ -509,9 +510,36 @@ class DevKit:
 
     async def disconnect(self) -> None:
         client, self._client = self._client, None
-        if client is not None:
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(client.disconnect(), timeout=OP_TIMEOUT)
+        subscribed, self._subscribed = self._subscribed, set()
+        if client is None:
+            return
+        if client.is_connected:
+            # Unsubscribe before dropping the link: the DevKit treats a client
+            # as connected while any notification is still on (newer firmware
+            # also ends the session itself once they are all off), and a bare
+            # link drop does not clear them on its side.
+            if not subscribed:
+                _trace("disconnect: no notifications to turn off")
+            for uuid in sorted(subscribed):
+                await self._stop_notify(client, uuid)
+        elif subscribed:
+            _trace("disconnect: link already down; nothing to turn off")
+        _trace("TX  disconnect")
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(client.disconnect(), timeout=OP_TIMEOUT)
+
+    @staticmethod
+    async def _stop_notify(client: Any, uuid: str) -> None:
+        """Turn notifications off. On Linux this returns once BlueZ has taken the
+        request; the DevKit's own reply (an ATT Write Response) is not visible here."""
+        _trace(f"TX  stop-notify {_char(uuid)}")
+        started = time.monotonic()
+        try:
+            await asyncio.wait_for(client.stop_notify(uuid), timeout=OP_TIMEOUT)
+            _trace(f"    done   stop-notify {_char(uuid)} in {_since(started)}")
+        except Exception as exc:  # never let cleanup fail the caller
+            _trace(f"    failed stop-notify {_char(uuid)} after {_since(started)}: "
+                   f"{exc or type(exc).__name__}")
 
     async def __aenter__(self) -> "DevKit":
         # The agent must be live before the first connect: the DevKit asks to
@@ -580,13 +608,17 @@ class DevKit:
     async def _subscribe_heartbeat(self) -> None:
         # Non-fatal: some firmware returns UNLIKELY_ERROR here while the link
         # is perfectly healthy.
-        with contextlib.suppress(Exception):
+        try:
             await asyncio.wait_for(
                 self._client.start_notify(
                     HEARTBEAT_UUID, lambda _s, data: _trace(f"RX  notify heartbeat: {_show(data)}")
                 ),
                 timeout=OP_TIMEOUT,
             )
+            self._subscribed.add(HEARTBEAT_UUID)
+            _trace("subscribed heartbeat")
+        except Exception as exc:
+            _trace(f"subscribe heartbeat failed: {exc or type(exc).__name__}")
 
     @contextlib.asynccontextmanager
     async def _notifications(self, uuid: str, handler):
@@ -603,6 +635,7 @@ class DevKit:
             with _ble_errors("subscribing to updates"):
                 await asyncio.wait_for(client.start_notify(uuid, traced), timeout=OP_TIMEOUT)
             subscribed = True
+            self._subscribed.add(uuid)
             _trace(f"subscribed {_char(uuid)} in {_since(started)}")
         except DevKitError as exc:
             # Subscribing can fail on its own; callers decide what that means.
@@ -611,9 +644,8 @@ class DevKit:
             yield subscribed
         finally:
             if subscribed:
-                with contextlib.suppress(Exception):
-                    await asyncio.wait_for(client.stop_notify(uuid), timeout=OP_TIMEOUT)
-                _trace(f"unsubscribed {_char(uuid)}")
+                self._subscribed.discard(uuid)
+                await self._stop_notify(client, uuid)
 
     # -- wifi scan -------------------------------------------------------
     async def scan_networks(self, timeout: float = NETWORK_SCAN_TIMEOUT) -> list[Network]:
