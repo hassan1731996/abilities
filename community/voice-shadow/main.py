@@ -18,8 +18,11 @@ HOTWORDS = {
     "sanity check my", "honest feedback on",
 }
 
-EXIT_WORDS = {"stop", "quit", "exit", "end", "bye", "goodbye", "done", "cancel"}
-EXIT_PHRASES = {"that's all", "all done", "never mind", "i'm done", "no thanks", "no more"}
+EXIT_WORDS = {"stop", "exit", "bye", "goodbye"}
+EXIT_PHRASES = {
+    "that's all", "all done", "never mind", "i'm done", "no thanks",
+    "no more", "i quit", "let's stop", "i'm done here",
+}
 
 CRITIQUE_PROMPT = (
     "You are a candid advisor reviewing someone's idea before the world tears it apart. "
@@ -207,7 +210,7 @@ class VoiceShadow(MatchingCapability):
         if not text:
             return True
         t = text.lower().strip()
-        tokens = set(t.split())
-        if tokens & EXIT_WORDS:
+        if any(p in t for p in EXIT_PHRASES):
             return True
-        return any(p in t for p in EXIT_PHRASES)
+        tokens = set(t.split())
+        return bool(tokens & EXIT_WORDS)
