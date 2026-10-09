@@ -501,7 +501,8 @@ class DevKit:
                     await asyncio.sleep(delay)
         raise DeviceNotFound(
             "Couldn't connect to the DevKit. Make sure it's switched on and "
-            "close by, then try again." + _detail("connect", last)
+            "close by, then try again. If it was connected to this computer "
+            "before, forget it in your Bluetooth settings and retry." + _detail("connect", last)
         )
 
     async def reconnect(self) -> None:
