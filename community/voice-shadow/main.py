@@ -1,3 +1,5 @@
+import asyncio
+import re
 import requests
 from datetime import datetime
 from src.agent.capability import MatchingCapability
@@ -44,6 +46,7 @@ DRILLDOWN_PROMPT = (
 class VoiceShadow(MatchingCapability):
     worker: AgentWorker = None
     capability_worker: CapabilityWorker = None
+    venice_key: str = ""
 
     # Do not change following tag of register capability
     # {{register capability}}
@@ -59,8 +62,13 @@ class VoiceShadow(MatchingCapability):
 
     async def _run(self):
         try:
-            self._venice_key = self.capability_worker.get_api_keys("venice_api_key") or ""
+            self.venice_key = self.capability_worker.get_api_keys("venice_api_key") or ""
             await self.capability_worker.wait_for_complete_transcription()
+            if not self.venice_key:
+                await self.capability_worker.speak(
+                    "I need a Venice API key for this. Please add venice_api_key in your API settings."
+                )
+                return
 
             await self.capability_worker.speak(
                 "Ready. Pitch me the idea — startup, plan, decision, anything."
@@ -82,7 +90,7 @@ class VoiceShadow(MatchingCapability):
 
                 await self.capability_worker.speak("Give me a second.")
 
-                critique = self._call_venice(CRITIQUE_PROMPT, f"Idea: {idea}")
+                critique = await asyncio.to_thread(self._call_venice, CRITIQUE_PROMPT, f"Idea: {idea}")
                 if not critique:
                     await self.capability_worker.speak(
                         "I couldn't reach my analysis engine — try again in a moment."
@@ -116,7 +124,7 @@ class VoiceShadow(MatchingCapability):
                                 outer_running = False
                                 break
                         await self.capability_worker.speak("Give me a second.")
-                        critique = self._call_venice(CRITIQUE_PROMPT, f"Idea: {idea}")
+                        critique = await asyncio.to_thread(self._call_venice, CRITIQUE_PROMPT, f"Idea: {idea}")
                         if not critique:
                             await self.capability_worker.speak(
                                 "I couldn't reach my analysis engine — try again in a moment."
@@ -126,7 +134,8 @@ class VoiceShadow(MatchingCapability):
                         await self.capability_worker.speak(critique)
                         self._save_session(idea, critique)
                     else:
-                        answer = self._call_venice(
+                        answer = await asyncio.to_thread(
+                            self._call_venice,
                             DRILLDOWN_PROMPT,
                             f"Original idea: {idea}\nFeedback given: {critique}\nQuestion: {followup}",
                         )
@@ -141,7 +150,7 @@ class VoiceShadow(MatchingCapability):
 
     def _call_venice(self, system_prompt: str, user_content: str) -> str:
         headers = {
-            "Authorization": f"Bearer {self._venice_key}",
+            "Authorization": f"Bearer {self.venice_key}",
             "Content-Type": "application/json",
         }
         payload = {
@@ -164,11 +173,12 @@ class VoiceShadow(MatchingCapability):
                     f"[VoiceShadow] Venice error: {resp.status_code}"
                 )
                 return ""
-            return (
+            text = (
                 (resp.json().get("choices") or [{}])[0]
                 .get("message", {})
                 .get("content") or ""
-            ).strip()
+            )
+            return re.sub(r"https?://\S+|[*#`_]", "", text).strip()
         except Exception as e:
             self.worker.editor_logging_handler.error(f"[VoiceShadow] Venice call failed: {e!r}")
             return ""
@@ -188,18 +198,18 @@ class VoiceShadow(MatchingCapability):
         return raw if raw in {"DRILL", "NEW_IDEA", "EXIT"} else "DRILL"
 
     def _save_session(self, idea: str, critique: str):
-        raw = self.capability_worker.get_single_key(STORAGE_KEY)
-        stored = (raw.get("value", raw) if raw else {}) or {}
-        sessions = stored.get("sessions", [])
-        sessions.append({
-            "idea": idea,
-            "critique": critique,
-            "timestamp": datetime.utcnow().isoformat(),
-        })
-        if len(sessions) > MAX_SESSIONS:
-            sessions = sessions[-MAX_SESSIONS:]
-        data = {"sessions": sessions}
         try:
+            raw = self.capability_worker.get_single_key(STORAGE_KEY)
+            stored = (raw.get("value", raw) if raw else {}) or {}
+            sessions = stored.get("sessions", [])
+            sessions.append({
+                "idea": idea,
+                "critique": critique,
+                "timestamp": datetime.utcnow().isoformat(),
+            })
+            if len(sessions) > MAX_SESSIONS:
+                sessions = sessions[-MAX_SESSIONS:]
+            data = {"sessions": sessions}
             result = self.capability_worker.create_key(STORAGE_KEY, data)
             if not (result or {}).get("success"):
                 self.capability_worker.update_key(STORAGE_KEY, data)
@@ -209,8 +219,10 @@ class VoiceShadow(MatchingCapability):
     def _is_exit(self, text: str) -> bool:
         if not text:
             return True
-        t = text.lower().strip()
+        t = text.lower().strip(" .,!?")
+        words = t.split()
+        if len(words) > 3:
+            return False
         if any(p in t for p in EXIT_PHRASES):
             return True
-        tokens = set(t.split())
-        return bool(tokens & EXIT_WORDS)
+        return bool(set(words) & EXIT_WORDS)
