@@ -168,6 +168,13 @@ def _word_count(text: str) -> int:
 class MemoryMirrorCapability(MatchingCapability):
     worker: AgentWorker = None
     capability_worker: CapabilityWorker = None
+    state: dict = {}
+    sources: list = None
+    summaries: dict = {}
+    cursor: int = 0
+    last_mode: str = ""
+    history_cutoff: int = 0
+    ending: bool = False
 
     # Do not change following tag of register capability
     # {{register capability}}
@@ -404,8 +411,14 @@ class MemoryMirrorCapability(MatchingCapability):
     def message_parts(message):
         if isinstance(message, dict):
             return message.get("role"), message.get("content")
-        role = message.role if hasattr(message, "role") else None
-        content = message.content if hasattr(message, "content") else None
+        try:
+            role = message.role
+        except AttributeError:
+            role = None
+        try:
+            content = message.content
+        except AttributeError:
+            content = None
         return role, content
 
     def conversation_text(self) -> str:
