@@ -86,6 +86,14 @@ FLAG_TEXT = {
 }
 MOOD_WORDS = {1: "low", 2: "a bit low", 3: "okay", 4: "good", 5: "great"}
 
+# Said outright, these get the urgent alert even when the LLM can't be reached to read them.
+STRONG_URGENT_RE = re.compile(
+    r"\b(i('ve| have)? (fallen|fell)( down| over)?|can'?t get up|cannot get up|can'?t breathe|"
+    r"cannot breathe|chest pains?|call an ambulance|heart attack|having a stroke|help me)\b"
+)
+RETRY_AFTER = 90  # seconds before a failed family email is tried again; never in the same poll
+MAX_PENDING = 5
+
 # Cheap pre-filter for the passive scan: only turns that might mention a health worry reach the LLM.
 CONCERN_HINT_RE = re.compile(
     r"\b(fell|fall(en|ing)?|tripped|slipped|chest|breath(e|ing|less)?|can'?t get up|cannot get up|"
@@ -202,7 +210,7 @@ def new_day(date: str) -> dict:
     return {
         "date": date, "slots": {}, "moods": [], "flags": [], "notes": [], "withheld": False,
         "open_thread": "", "last_heard": 0, "digest_sent": False, "urgent_at": 0, "urgent_sig": "",
-        "manual_at": 0,
+        "manual_at": 0, "pending": [], "digest_tries": 0,
     }
 
 
@@ -233,8 +241,78 @@ def normalize_state(data) -> dict:
         state["log"] = [d for d in data["log"] if isinstance(d, dict) and isinstance(d.get("date"), str)][-LOG_DAYS:]
     if isinstance(data.get("last_digest"), str):
         state["last_digest"] = data["last_digest"][:600]
-    state["intro_done"] = data.get("intro_done") is True
+    if "intro_done" in data:
+        state["intro_done"] = data.get("intro_done") is True
+    else:
+        # Saved before the intro had its own flag. Someone who already changed a setting or checked in
+        # by voice has used the skill, so they don't hear the first-run intro again after an update.
+        used = state["settings"] != default_state()["settings"] or bool(state["today"].get("manual_at"))
+        state["intro_done"] = used
     return state
+
+
+SLOT_RANK = {"pending": 0, "asked": 1, "retried": 2, "paused": 3, "not_asked": 3, "missed": 3, "answered": 4}
+
+
+def stored_value(result):
+    """Unwrap a get_single_key reply: the value, or None if never saved. Raises on a failed read.
+
+    A missing key comes back as {"key": "", "value": None}; failures carry "success": False.
+    """
+    if result is None:
+        return None
+    if not isinstance(result, dict) or result.get("success") is False or result.get("error"):
+        raise ValueError("storage read failed")
+    data = result.get("value")
+    if isinstance(data, str):
+        data = json.loads(data) if data.strip() else None
+    return data
+
+
+def merge_today(skill_day: dict, daemon_day: dict) -> dict:
+    """One day's record from the skill's copy and the daemon's copy, so neither side's progress is lost.
+
+    The daemon owns the email fields; slots keep whichever side got further ("answered" wins).
+    """
+    merged = dict(skill_day)
+    merged["digest_sent"] = bool(skill_day.get("digest_sent") or daemon_day.get("digest_sent"))
+    merged["digest_tries"] = daemon_day.get("digest_tries", 0)
+    merged["pending"] = list(daemon_day.get("pending") or [])
+    if daemon_day.get("urgent_at", 0) > skill_day.get("urgent_at", 0):
+        merged["urgent_at"], merged["urgent_sig"] = daemon_day["urgent_at"], daemon_day.get("urgent_sig", "")
+    for key in ("last_heard", "manual_at"):
+        merged[key] = max(skill_day.get(key, 0), daemon_day.get(key, 0))
+    merged["withheld"] = bool(skill_day.get("withheld") or daemon_day.get("withheld"))
+    merged["open_thread"] = skill_day.get("open_thread") or daemon_day.get("open_thread") or ""
+    slots = {k: dict(v) for k, v in skill_day.get("slots", {}).items()}
+    for slot, entry in daemon_day.get("slots", {}).items():
+        mine = slots.get(slot)
+        if mine is None or SLOT_RANK.get(entry.get("status"), 0) > SLOT_RANK.get(mine.get("status"), 0):
+            slots[slot] = dict(entry)
+    merged["slots"] = slots
+    for key in ("flags", "notes", "moods"):
+        merged[key] = list(skill_day.get(key, [])) + [v for v in daemon_day.get(key, []) if v not in skill_day.get(key, [])]
+    return merged
+
+
+def merge_states(skill_state: dict, daemon_state: dict) -> dict:
+    """Whole state: settings and the intro flag from the skill, day progress from both sides.
+
+    If one side already moved to a new day, the other side's copy is rolled forward first, so a
+    setting saved just before midnight is never dropped.
+    """
+    skill_state, daemon_state = json.loads(json.dumps(skill_state)), json.loads(json.dumps(daemon_state))
+    skill_date, daemon_date = skill_state["today"]["date"], daemon_state["today"]["date"]
+    if daemon_date > skill_date:
+        roll_day(skill_state, daemon_date)
+    elif skill_date > daemon_date:
+        roll_day(daemon_state, skill_date)
+    skill_state["today"] = merge_today(skill_state["today"], daemon_state["today"])
+    if daemon_date > skill_date:
+        skill_state["log"] = daemon_state["log"]  # the daemon already archived the day it rolled
+    skill_state["last_digest"] = daemon_state.get("last_digest") or skill_state.get("last_digest", "")
+    skill_state["intro_done"] = bool(skill_state.get("intro_done") or daemon_state.get("intro_done"))
+    return skill_state
 
 
 def parse_recipients(raw) -> list:
@@ -298,6 +376,7 @@ class CheckInCompanionBackground(MatchingCapability):
     capability_worker: CapabilityWorker = None
     background_daemon_mode: bool = False
     tail: list = []
+    no_recipients: bool = False
     name: str = ""
     profile_read: bool = False
     tz_name: str = ""
@@ -310,8 +389,6 @@ class CheckInCompanionBackground(MatchingCapability):
         self.background_daemon_mode = background_daemon_mode  # set BEFORE constructing the worker
         self.capability_worker = CapabilityWorker(self)  # daemon: pass self, not self.worker
         self.tail = []
-        self.digest_tries = {}
-        self.pending_emails = []
         self.no_recipients = False
         self.name = ""
         self.profile_read = False
@@ -364,7 +441,7 @@ class CheckInCompanionBackground(MatchingCapability):
 
         changed = await self.run_schedule(state, now) or changed
         changed = await self.maybe_send_digest(state, now) or changed
-        await self.flush_pending_emails()
+        changed = await self.flush_pending_emails(state) or changed
         if changed:
             self.save_state(state)
 
@@ -598,6 +675,12 @@ class CheckInCompanionBackground(MatchingCapability):
             calls += 1
             nonce = secrets.token_hex(4)
             result = self.llm_json(self.fence(text, nonce), PASSIVE_SYSTEM.format(nonce=nonce, flags=", ".join(FLAGS)))
+            if result is None and STRONG_URGENT_RE.search(text.lower()):
+                # The LLM is down or unreadable, but a plain call for help must still get through.
+                self.log("urgent phrase matched without LLM")
+                await self.urgent(state, text)
+                changed = True
+                continue
             if not result or result.get("concern") is not True:
                 continue
             add_flags(today, result.get("flags"))
@@ -621,7 +704,7 @@ class CheckInCompanionBackground(MatchingCapability):
         name = self.name or "Your family member"
         flags = [FLAG_TEXT[f] for f in FLAGS if f in today["flags"]] or ["said something that sounded urgent"]
         sent = await self.email_or_queue(
-            f"Urgent: {name} may need help",
+            state, f"Urgent: {name} may need help",
             f"{name} {', '.join(flags)} while talking to their OpenHome speaker just now, "
             f"around {clock_of(self.local_now())}.\n\n"
             f"Please call {name} to check they are okay. If you can't reach them and you are worried, "
@@ -643,7 +726,7 @@ class CheckInCompanionBackground(MatchingCapability):
             heard_text = (" They last spoke to the speaker around "
                           f"{clock_of(datetime.fromtimestamp(heard, self.local_now().tzinfo))}.")
         sent = await self.email_or_queue(
-            f"Check-in: {name} hasn't answered",
+            state, f"Check-in: {name} hasn't answered",
             f"{name} didn't answer the {clock_text(slot)} check-in, even after a gentle reminder.{heard_text}\n\n"
             "They may simply be out or busy. You might want to give them a call.\n\n"
             "This alert comes from the Check-In Companion ability. It is not an emergency service.",
@@ -667,29 +750,48 @@ class CheckInCompanionBackground(MatchingCapability):
         sent = await self.email_family(f"Daily check-in: {name}, {day_text(now)}", body)
         if sent:
             state["last_digest"] = digest_summary(today, settings["slots"])
-        elif self.digest_tries.get(today["date"], 0) < 2:
+        elif not self.no_recipients and today.get("digest_tries", 0) < 2:
             # A failed send is tried again on the next polls instead of silently losing the day's note.
-            self.digest_tries[today["date"]] = self.digest_tries.get(today["date"], 0) + 1
+            # The count is saved with the day, so a restart doesn't reset it.
+            today["digest_tries"] = today.get("digest_tries", 0) + 1
             today["digest_sent"] = False
         self.log(f"digest sent={sent}")
         return True
 
-    async def email_or_queue(self, subject: str, body: str) -> bool:
-        """Send now; if the send itself failed (not for lack of recipients), try again on later polls."""
+    async def email_or_queue(self, state: dict, subject: str, body: str) -> bool:
+        """Send now; if the send itself failed (not for lack of recipients), try again on later polls.
+
+        The queue is saved with the state, so a daemon restart doesn't lose an alert.
+        """
         sent = await self.email_family(subject, body)
-        if not sent and not self.no_recipients and len(self.pending_emails) < 5:
-            self.pending_emails.append({"subject": subject, "body": body, "tries": 0})
+        pending = state["today"].setdefault("pending", [])
+        if not sent and not self.no_recipients and len(pending) < MAX_PENDING:
+            pending.append({"subject": subject[:200], "body": body[:2000], "tries": 0,
+                            "next_at": int(time.time()) + RETRY_AFTER})
         return sent
 
-    async def flush_pending_emails(self):
-        for item in list(self.pending_emails):
-            item["tries"] += 1
-            if await self.email_family(item["subject"], item["body"]):
-                self.pending_emails.remove(item)
+    async def flush_pending_emails(self, state: dict) -> bool:
+        """Retry queued alerts whose wait is over. Returns True when the queue changed."""
+        pending = state["today"].get("pending") or []
+        changed = False
+        for item in list(pending):
+            if not isinstance(item, dict) or not isinstance(item.get("subject"), str):
+                pending.remove(item)
+                changed = True
+                continue
+            if time.time() < item.get("next_at", 0):
+                continue
+            item["tries"] = item.get("tries", 0) + 1
+            changed = True
+            if await self.email_family(item["subject"], str(item.get("body") or "")):
+                pending.remove(item)
                 self.log("queued alert sent")
-            elif item["tries"] >= 3:
-                self.pending_emails.remove(item)
+            elif item["tries"] >= 3 or self.no_recipients:
+                pending.remove(item)
                 self.log_error("queued alert dropped after 3 tries")
+            else:
+                item["next_at"] = int(time.time()) + RETRY_AFTER * item["tries"]
+        return changed
 
     async def email_family(self, subject: str, body: str) -> bool:
         try:
@@ -798,13 +900,7 @@ class CheckInCompanionBackground(MatchingCapability):
         None makes the caller skip this poll, so a storage hiccup never overwrites saved data.
         """
         try:
-            result = self.capability_worker.get_single_key(STATE_KEY)
-            if not isinstance(result, dict) or result.get("error"):
-                raise ValueError("unexpected storage reply")  # not the same as a key that was never saved
-            data = result.get("value")
-            if isinstance(data, str):
-                data = json.loads(data)
-            return normalize_state(data)
+            return normalize_state(stored_value(self.capability_worker.get_single_key(STATE_KEY)))
         except Exception as error:
             self.log_error(f"State unreadable, skipping this poll: {type(error).__name__}")
             return None
@@ -824,20 +920,7 @@ class CheckInCompanionBackground(MatchingCapability):
     def merge_with_skill(self, state: dict) -> dict:
         """The skill may have opened while this poll was running. Keep what it saved, add what this poll did."""
         fresh = self.load_state()
-        if fresh is None or fresh["today"]["date"] != state["today"]["date"]:
-            return state
-        mine, theirs = state["today"], fresh["today"]
-        theirs["digest_sent"] = bool(theirs.get("digest_sent") or mine.get("digest_sent"))
-        if mine.get("urgent_at", 0) > theirs.get("urgent_at", 0):
-            theirs["urgent_at"], theirs["urgent_sig"] = mine["urgent_at"], mine.get("urgent_sig", "")
-        for slot, entry in mine["slots"].items():
-            existing = theirs["slots"].get(slot)
-            if existing is None or existing.get("status") == "pending":
-                theirs["slots"][slot] = entry  # only this poll moved the slot; the skill hasn't answered it
-        for key in ("flags", "notes", "moods"):
-            theirs[key] = theirs[key] + [v for v in mine[key] if v not in theirs[key]]
-        fresh["last_digest"] = state.get("last_digest") or fresh.get("last_digest", "")
-        return fresh
+        return state if fresh is None else merge_states(fresh, state)
 
     def save_state(self, state: dict) -> bool:
         """Context Storage save: create_key first, then update_key, checking the `success` field.
@@ -846,6 +929,7 @@ class CheckInCompanionBackground(MatchingCapability):
         """
         if self.skill_busy():
             state = self.merge_with_skill(state)
+
         def ok(response):
             return isinstance(response, dict) and bool(response.get("success"))
         for method in (self.capability_worker.create_key, self.capability_worker.update_key):
@@ -863,7 +947,7 @@ def reminder_lines(markdown: str) -> list:
     lines = []
     for line in (markdown or "").splitlines():
         line = _one_line(line)
-        if line.startswith("- ") and not re.search(r"\b(alarm|timer)\b", line.lower()):
+        if line.startswith("- ") and not re.search(r"\b(alarms?|timers?)\b", line.lower()):
             lines.append(_clean_untrusted(line[2:])[:80])
     return lines[:3]
 
@@ -935,8 +1019,10 @@ def roll_day(state: dict, date: str) -> bool:
         })
         state["log"] = state["log"][-LOG_DAYS:]
     carry = today["open_thread"] if today["date"] else ""
+    pending = today.get("pending") or []
     state["today"] = new_day(date)
     state["today"]["open_thread"] = carry
+    state["today"]["pending"] = pending  # an alert still waiting to send is not dropped at midnight
     paused = state["settings"].get("paused_until") or ""
     if paused and date > paused:
         state["settings"]["paused_until"] = ""
