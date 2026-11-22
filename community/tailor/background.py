@@ -65,10 +65,14 @@ FEEDBACK_HINT_RE = re.compile(
 UNSAFE_RE = re.compile(
     r"\b(ignore|disregard|system prompt|jailbreak|pretend|you are now|act as|role ?play|reveal|password|"
     r"api key|execute|http|www|safety|unsafe|illegal|bypass|override|admin|developer mode|"
-    r"ability|abilities|skill|install|purchase|buy|delete|transfer|wallet|from now on|forget (all|everything|"
+    r"ability|abilities|skill|install|purchase|buy|delete|transfer|wallet|forget (all|everything|"
     r"previous|your)|previous instructions|new instructions|instead of answering|respond only with|"
-    r"do not follow|always say)\b"
+    r"do not follow|access token|use (the|a|an|my|your) [a-z ]{0,20}tool|"
+    r"send (a|an|the|my|them|it|this|that|me|him|her|an email|emails?|messages?)|"
+    r"run (a|an|the|this|that|my) ?[a-z ]{0,20}command)\b"
 )
+# "From now on, keep it short" or "Always say temperatures in Celsius" are ordinary style rules, so
+# those phrases are not blocked; actions (send, run a command, use a tool) are.
 
 EXTRACT_SYSTEM = """You help a voice assistant learn HOW one user wants it to talk. You are shown the
 assistant's previous reply and the user's next message. Both are wrapped in <<<MSG-{nonce}>>> ...
@@ -159,6 +163,11 @@ def render_md(rules: list) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _rules_part(markdown: str) -> str:
+    """The style file without its "(Updated ...)" line, for comparing rules only."""
+    return "\n".join(line for line in (markdown or "").splitlines() if not line.startswith("(Updated "))
+
+
 class TailorBackground(MatchingCapability):
     worker: AgentWorker = None
     capability_worker: CapabilityWorker = None
@@ -204,10 +213,10 @@ class TailorBackground(MatchingCapability):
         start = self.new_start(history)
 
         # While the Tailor skill is open it owns the state, and its own conversation
-        # ("forget the short one") is about rules, not feedback on replies; skip it.
-        # The tail is not moved here, so these turns are looked at on the next poll instead of being lost
-        # (the skill's own turns are skipped then because the busy flag outlasts it briefly).
+        # ("forget the short one") is about rules, not feedback on replies. Move past those turns so
+        # they are never learned as feedback once the skill closes.
         if self.skill_busy():
+            self.tail = [self.message_parts(m) for m in history[-TAIL_SIZE:]]
             return
         state = self.load_state()
         if state is None:
@@ -366,21 +375,15 @@ class TailorBackground(MatchingCapability):
 
         target = same_scope.get(found["replaces"])
         if target is not None and target.get("source") == "voice":
-            # Rules the user added by voice never expire and are only changed by voice.
+            # Rules the user added by voice never expire and are only changed by voice. The feedback
+            # itself still counts below, as a new or pending rule.
             self.log("left a voice-added rule alone")
-            return False
+            target = None
         if target is not None and found["kind"] == "explicit":
-            replaced = {**target, "text": found["text"], "category": found["category"], "scope": found["scope"],
-                        "source": found["kind"], "evidence": found["evidence"],
-                        "created": today, "last_seen": today, "hits": 1}
-            others = [r for r in rules if r is not target]
-            if len(render_md(others + [replaced]).split()) > MD_WORD_CAP:
-                self.log("replacement skipped, style file would be too long")
-                return False
-            target.update(replaced)
-            self.log(f"rule {target['id']} replaced")
-            return True
-        # One indirect signal never overturns an established rule; it is counted like any other.
+            return self.replace_rule(state, target, found, hits=1, created=today)
+        # One indirect signal never overturns an established rule. It waits as pending, remembering
+        # which rule it contradicts, and replaces that rule only if it comes up again.
+        contradicts = target["id"] if target is not None else ""
 
         target = same_kind.get(found["same_as"])
         if target is not None:
@@ -392,16 +395,35 @@ class TailorBackground(MatchingCapability):
         seed = pending_by_id.get(found["same_as"])
         if seed is not None:
             pending.remove(seed)
+            old = next((r for r in rules if r["id"] in (seed.get("replaces"), contradicts)
+                        and r.get("source") != "voice"), None)
+            if old is not None:
+                return self.replace_rule(state, old, found, hits=2, created=seed.get("created", today))
             return self.add_rule(state, found, hits=2, created=seed.get("created", today))
 
         if found["kind"] == "explicit":
             return self.add_rule(state, found, hits=1, created=today)
 
         pending.append({"id": f"p{state['next_id']}", "text": found["text"], "category": found["category"],
-                        "scope": found["scope"], "evidence": found["evidence"], "created": today})
+                        "scope": found["scope"], "evidence": found["evidence"], "created": today,
+                        "replaces": contradicts})
         state["next_id"] += 1
         del pending[:-MAX_PENDING]
         self.log(f"pending rule noted total={len(pending)}")
+        return True
+
+    def replace_rule(self, state: dict, target: dict, found: dict, hits: int, created: str) -> bool:
+        """Swap a learned rule for the new one in place, so two contradicting rules never sit side by side."""
+        today = _today()
+        replaced = {**target, "text": found["text"], "category": found["category"], "scope": found["scope"],
+                    "source": found["kind"], "evidence": found["evidence"],
+                    "created": created, "last_seen": today, "hits": hits}
+        others = [r for r in state["rules"] if r is not target]
+        if len(render_md(others + [replaced]).split()) > MD_WORD_CAP:
+            self.log("replacement skipped, style file would be too long")
+            return False
+        target.update(replaced)
+        self.log(f"rule {target['id']} replaced")
         return True
 
     def add_rule(self, state: dict, found: dict, hits: int, created: str) -> bool:
@@ -446,9 +468,11 @@ class TailorBackground(MatchingCapability):
         state = _empty_state()
         try:
             result = self.capability_worker.get_single_key(STATE_KEY)
-            if not isinstance(result, dict) or result.get("error"):
+            # A missing key comes back as {"key": "", "value": None} (or None); a failure has "success": False.
+            if result is not None and (not isinstance(result, dict) or result.get("success") is False
+                                       or result.get("error")):
                 raise ValueError("unexpected storage reply")  # a failed read is not an empty state
-            data = result.get("value")
+            data = result.get("value") if isinstance(result, dict) else None
             if isinstance(data, str):
                 data = json.loads(data)
             if not isinstance(data, dict):
@@ -509,15 +533,29 @@ class TailorBackground(MatchingCapability):
         await self.sync_style_file(state)
 
     async def sync_style_file(self, state: dict):
-        """Make tailor_style.md match the saved rules. Safe to call every poll; it only writes on a difference."""
+        """Make tailor_style.md match the saved rules. Safe to call every poll; it only writes on a difference.
+
+        Only the rules are compared, not the "(Updated ...)" date, so the file isn't rewritten every day or at
+        every session start.
+        """
         content = render_md(state["rules"]) if state["rules"] else ""
-        if content == self.last_md:
+        wanted = _rules_part(content)
+        if wanted == self.last_md:
+            return
+        # The skill may have opened, and written the file, while this poll's LLM calls ran.
+        if self.skill_busy():
             return
         try:
-            if await self.capability_worker.check_if_file_exists(MD_FILE, False):
+            exists = await self.capability_worker.check_if_file_exists(MD_FILE, False)
+            if exists and self.last_md == UNSET:
+                current = await self.capability_worker.read_file(MD_FILE, False)
+                if _rules_part(current if isinstance(current, str) else "") == wanted:
+                    self.last_md = wanted
+                    return
+            if exists:
                 await self.capability_worker.delete_file(MD_FILE, False)
             if content:
                 await self.capability_worker.write_file(MD_FILE, content, False)
-            self.last_md = content
+            self.last_md = wanted
         except Exception as error:
             self.log_error(f"Style file write failed: {type(error).__name__}")

@@ -62,10 +62,14 @@ QUICK_NEXT = {"next", "next one", "continue", "go on", "keep going"}
 UNSAFE_RE = re.compile(
     r"\b(ignore|disregard|system prompt|jailbreak|pretend|you are now|act as|role ?play|reveal|password|"
     r"api key|execute|http|www|safety|unsafe|illegal|bypass|override|admin|developer mode|"
-    r"ability|abilities|skill|install|purchase|buy|delete|transfer|wallet|from now on|forget (all|everything|"
+    r"ability|abilities|skill|install|purchase|buy|delete|transfer|wallet|forget (all|everything|"
     r"previous|your)|previous instructions|new instructions|instead of answering|respond only with|"
-    r"do not follow|always say)\b"
+    r"do not follow|access token|use (the|a|an|my|your) [a-z ]{0,20}tool|"
+    r"send (a|an|the|my|them|it|this|that|me|him|her|an email|emails?|messages?)|"
+    r"run (a|an|the|this|that|my) ?[a-z ]{0,20}command)\b"
 )
+# "From now on, keep it short" or "Always say temperatures in Celsius" are ordinary style rules, so
+# those phrases are not blocked; actions (send, run a command, use a tool) are.
 
 HELP_TEXT = (
     "You can ask how I've learned to talk to you, ask why I do something, "
@@ -748,9 +752,11 @@ class TailorCapability(MatchingCapability):
         """Load saved rules. False only when storage can't be read, so nothing gets overwritten."""
         try:
             result = self.capability_worker.get_single_key(STATE_KEY)
-            if not isinstance(result, dict) or result.get("error"):
+            # A missing key comes back as {"key": "", "value": None} (or None); a failure has "success": False.
+            if result is not None and (not isinstance(result, dict) or result.get("success") is False
+                                       or result.get("error")):
                 raise ValueError("unexpected storage reply")  # a failed read must not look like "no rules yet"
-            data = result.get("value")
+            data = result.get("value") if isinstance(result, dict) else None
             if isinstance(data, str):
                 data = json.loads(data)
             if not isinstance(data, dict):
