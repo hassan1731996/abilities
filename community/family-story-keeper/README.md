@@ -17,6 +17,7 @@ Avoid "tell me a story". Bedtime Stories already uses it.
 
 ## Setup
 - **Optional: link Google** in Settings → Linked Accounts. Recordings are then saved to your own Google Drive in a folder called `OpenHome Family Stories`, with one subfolder per storyteller. Nothing is uploaded anywhere else.
+- **Google permissions.** Recording needs your linked Google account to let the ability create folders and files in your Google Drive, download them for playback and delete them. It only touches the `OpenHome Family Stories` folder it creates. Without Google linked, no audio is kept and only transcripts are saved. If the link is revoked or lacks Drive access, recording turns off for the rest of the session instead of failing on every answer.
 - Without Google linked, it still works and keeps the transcripts only. No audio is recorded.
 - No API keys. Works in the Live Editor and on any device.
 
@@ -44,16 +45,18 @@ It reads, and never writes, what the household has already shared, so it asks le
 All of it is fenced off as untrusted data in prompts, never read aloud verbatim and never logged. Voice Journal and other private notes are deliberately not read.
 
 ### The assistant learns the family
-**Google permissions.** Recording needs your linked Google account to let the ability create folders and files in your Google Drive, download them for playback and delete them. It only touches the "Family Story Keeper" folder it creates. Without Google linked, no audio is kept and only transcripts are saved.
-
-**Safety of your saved stories.** If saved stories can't be read for a moment (a storage hiccup), the ability says so and saves nothing instead of treating them as empty. Deleting someone says if any recordings could not be removed from Drive. A "tell me a little more" answer keeps both recordings and plays them in order. After two silent questions in a row the interview stops. A family member's queued question is only cleared once the answer is saved. When a storyteller is first added the ability tells them that short highlights are shared with the assistant, and how to turn that off.
-
 Unless you say "keep the stories private", the skill writes a short `family_story_keeper.md` note: who has been recorded and the 5 newest one-line highlights. The note stays under 180 words. OpenHome adds it to the assistant's context, so everyday conversation can reflect the family's history.
 
 ### Safety and privacy
 - **Consent first.** Every interview starts with a spoken recording notice and needs a "yes".
 - **Your recordings stay in your own Drive.** Context Storage keeps the transcript, a one-line summary and the Drive file ID for each story. Audio is downloaded only when someone asks to hear it.
-- **Deleting is real.** Deleting a person removes their Drive folder and every recording in it.
+- **One storage key.** OpenHome allows 10 Context Storage keys per account, shared by every ability, so all storytellers and stories live in the single `family_story_keeper_index` key. Stories saved by an older version (one key per storyteller) are moved into it on the next save and the old keys are removed. If the account's storage is full, it says so instead of a generic error.
+- **Deleting is real.** Deleting a person removes their Drive folder and every recording in it. It says if any recordings could not be removed from Drive.
+- **A storage hiccup never wipes stories.** If saved stories can't be read for a moment, the ability says so before asking to record, saves nothing over them, and leaves the assistant's highlights note as it was instead of reporting zero stories.
+- **Recordings match the words.** A "tell me a little more" answer keeps both recordings and plays them in order. If one part can't be kept or played, it says so.
+- **Gentle endings.** After two silent questions in a row the interview ends with one goodbye. A family member's queued question is asked at most once per session and is only cleared once the answer is saved.
+- **Names stay separate.** If "grandma" could mean two people, it asks which one instead of starting a new storyteller.
+- **Highlights are opt-out.** When a storyteller is first added the ability tells them that short highlights are shared with the assistant, and how to turn that off.
 - **Stories are treated as data.** Transcripts are fenced off with random markers in every prompt, and highlights that look like instructions are never written to the assistant note.
 - **Logs never contain stories.** They record intents and counts only.
 - **Limits:** 6 storytellers, 50 stories each, 10 queued questions. Transcripts are capped at 1,200 characters, and recordings over about 10 MB are kept as text only.

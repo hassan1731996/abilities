@@ -31,7 +31,10 @@ from src.main import AgentWorker
 
 TAG = "[FamilyStoryKeeper]"
 INDEX_KEY = "family_story_keeper_index"
+# Everything now lives in INDEX_KEY: OpenHome allows only 10 Context Storage keys per account, shared by all
+# abilities. Older versions kept one key per storyteller under this prefix; they are read once and removed.
 TELLER_KEY_PREFIX = "family_story_keeper_"
+MAX_STORE_CHARS = 1_200_000  # one stored value; a 1.5 MB value round-trips, 5 MB is refused
 MD_FILE = "family_story_keeper.md"
 OWN_FILES = (MD_FILE,)
 CONTEXT_FILES = ("user_profile.md", "user_summary.md", "memory_mirror_corrections.md")
@@ -242,7 +245,10 @@ class FamilyStoryKeeperCapability(MatchingCapability):
     index_ok: bool = True
     bad_tellers: set = set()
     known_keys: set = set()
+    legacy_keys: set = set()
+    store_problem: str = ""
     upload_warned: bool = False
+    asked_self_name: bool = False
 
     # Do not change following tag of register capability
     # {{register capability}}
@@ -263,7 +269,10 @@ class FamilyStoryKeeperCapability(MatchingCapability):
         self.index_ok = True
         self.bad_tellers = set()
         self.known_keys = set()
+        self.legacy_keys = set()
+        self.store_problem = ""
         self.upload_warned = False
+        self.asked_self_name = False
         self.worker.session_tasks.create(self.run())
 
     # ------------------------------------------------------------------ logging
@@ -458,6 +467,40 @@ class FamilyStoryKeeperCapability(MatchingCapability):
         # "grandma" matching both Grandma Ruth and Grandma Sue is ambiguous, so ask rather than guess.
         return found[0] if len(found) == 1 else None
 
+    def match_candidates(self, hint: str) -> list:
+        """Every storyteller a hint could mean, for asking which one when it is ambiguous."""
+        hint_norm = _normalize(hint)
+        if not hint_norm:
+            return []
+        hint_words = {w for w in hint_norm.split() if len(w) >= 3}
+        found = []
+        for teller in self.index["tellers"]:
+            name_norm = _normalize(teller["name"])
+            # Whole words only, so "Dadi" never counts as "Dad"; "record grandma" shares "grandma".
+            if name_norm and (hint_norm == name_norm or hint_norm in name_norm.split()
+                              or hint_words & set(name_norm.split())
+                              or re.search(rf"(?<!\w){re.escape(name_norm)}(?!\w)", hint_norm)):
+                found.append(teller)
+        return found
+
+    async def find_teller(self, hint: str):
+        """(teller or None, gave_up). Asks "which one?" when a hint fits more than one person."""
+        teller = self.match_teller(hint)
+        if teller:
+            return teller, False
+        candidates = self.match_candidates(hint)
+        if len(candidates) < 2:
+            return None, False
+        listed = [t["name"] for t in candidates[:3]]
+        names = ", ".join(listed[:-1]) + " or " + listed[-1]
+        answer = await self.ask(f"Which one, {names}?")
+        teller = self.match_teller(answer) if answer else None
+        if teller:
+            return teller, False
+        if not self.ending:
+            await self.capability_worker.speak("I couldn't tell which one. Say the full name next time.")
+        return None, True
+
     # ------------------------------------------------------------------ what the household already told OpenHome
 
     async def read_shared(self, filename: str) -> str:
@@ -546,6 +589,7 @@ class FamilyStoryKeeperCapability(MatchingCapability):
             if name:
                 return name
             # No name in the profile: ask, rather than recording someone called "You".
+            self.asked_self_name = True
             answer = await self.ask("What name should I use for you?")
             if not answer or self.ending or _normalize(answer) in QUICK_SELF:
                 return ""
@@ -572,6 +616,7 @@ class FamilyStoryKeeperCapability(MatchingCapability):
         Returns (existing teller or None, name). An empty name means the user gave up or left.
         """
         tellers = self.index["tellers"]
+        self.asked_self_name = False
         if not hint:
             if len(tellers) == 1:
                 return tellers[0], tellers[0]["name"]
@@ -589,19 +634,23 @@ class FamilyStoryKeeperCapability(MatchingCapability):
                     hint = await self.ask("Whose stories are we recording today? Say their name, or say mine.")
             if not hint:
                 return None, ""
-        existing = self.match_teller(hint)
+        existing, gave_up = await self.find_teller(hint)
         if existing:
             return existing, existing["name"]
+        if gave_up:
+            return None, ""
         name = await self.resolve_name(hint)
-        if not name and not self.ending:
-            # e.g. "someone new": just ask, once.
+        if not name and not self.ending and not self.asked_self_name:
+            # e.g. "someone new": just ask, once. Not again after "What name should I use for you?".
             hint = await self.ask("Who's telling stories today?")
             name = await self.resolve_name(hint) if hint else ""
         if self.ending:
             return None, ""
-        existing = self.match_teller(name)
+        existing, gave_up = await self.find_teller(name)
         if existing:
             return existing, existing["name"]
+        if gave_up:
+            return None, ""
         if not name:
             await self.capability_worker.speak("I didn't catch a name. Say record a story to try again.")
             return None, ""
@@ -617,12 +666,12 @@ class FamilyStoryKeeperCapability(MatchingCapability):
         snapshot = self.copy(self.index)
         self.index["tellers"].append(teller)
         self.index["next_teller"] += 1
-        self.tellers[teller["id"]] = {"version": 1, "id": teller["id"], "folder": "", "stories": [], "next_id": 1}
-        saved = self.store_key(INDEX_KEY, self.index)
-        if not (saved and self.store_key(self.teller_key(teller["id"]), self.tellers[teller["id"]])):
+        self.tellers[teller["id"]] = self.clean_teller(teller["id"], None)
+        # One write for the person and their (empty) stories, so a failure can't leave half a storyteller.
+        if not self.save_all():
             self.index = snapshot
             self.tellers.pop(teller["id"], None)
-            await self.capability_worker.speak("Sorry, I couldn't save that. Nothing was started.")
+            await self.capability_worker.speak(self.save_failed_line("Nothing was started."))
             return None
         self.log(f"teller created total={len(self.index['tellers'])}")
         return teller
@@ -646,9 +695,10 @@ class FamilyStoryKeeperCapability(MatchingCapability):
         question = str(result.get("question") or "").strip() if isinstance(result, dict) else ""
         return question or f"Tell me about your {CHAPTER_LABELS[chapter]}. What comes to mind first?"
 
-    def pop_queued(self, teller_id: str):
+    def pop_queued(self, teller_id: str, tried: list):
+        """The next family question for this teller that hasn't been tried this session."""
         for item in self.index["queue"]:
-            if item.get("teller") == teller_id:
+            if item.get("teller") == teller_id and not any(item is t for t in tried):
                 return item
         return None
 
@@ -660,6 +710,13 @@ class FamilyStoryKeeperCapability(MatchingCapability):
         for _ in range(3):
             if not name:
                 return
+            if teller:
+                self.load_teller(teller["id"])
+                if teller["id"] in self.bad_tellers:
+                    # Say so before asking for consent to something that can't happen.
+                    await self.capability_worker.speak(
+                        f"I can't read {teller['name']}'s saved stories right now, so I won't record over them.")
+                    return
             if teller and len(self.load_teller(teller["id"])["stories"]) >= MAX_STORIES_PER_TELLER:
                 await self.capability_worker.speak(f"{name}'s collection is full at {MAX_STORIES_PER_TELLER} stories.")
                 return
@@ -687,14 +744,15 @@ class FamilyStoryKeeperCapability(MatchingCapability):
             return
 
         background = await self.teller_background(teller)
-        saved, skipped = [], set()
+        saved, skipped, tried = [], set(), []
         silent = 0
         for round_number in range(1, MAX_ROUNDS + 1):
             for _ in range(QUESTIONS_PER_SESSION):
                 if self.ending or len(data["stories"]) >= MAX_STORIES_PER_TELLER:
                     break
-                queued = self.pop_queued(teller["id"])
+                queued = self.pop_queued(teller["id"], tried)
                 if queued:
+                    tried.append(queued)  # skipped or not, it isn't asked twice in one session
                     chapter = ""
                     question = "Someone in the family wanted to ask you this. " + queued["question"]
                 else:
@@ -704,14 +762,14 @@ class FamilyStoryKeeperCapability(MatchingCapability):
                 if queued and isinstance(outcome, list):
                     # Only an answer that was saved clears a family member's question.
                     self.index["queue"] = [q for q in self.index["queue"] if q is not queued]
-                    self.store_key(INDEX_KEY, self.index)
+                    self.save_all()
                 if outcome == "exit":
                     break
                 silent = silent + 1 if outcome == "silent" else 0
                 if silent >= 2:
-                    await self.capability_worker.speak("I'll leave it there for now. We can pick it up another time.")
                     self.ending = True
-                    break
+                    await self.finish_interview(teller, saved, stopped=True, quiet=True)
+                    return
                 if outcome in ("skipped", "silent") and chapter:
                     skipped.add(chapter)
                 elif isinstance(outcome, list):
@@ -734,15 +792,15 @@ class FamilyStoryKeeperCapability(MatchingCapability):
         await self.finish_interview(teller, saved, stopped=self.ending)
         self.ending = True
 
-    async def finish_interview(self, teller: dict, saved: list, stopped: bool):
+    async def finish_interview(self, teller: dict, saved: list, stopped: bool, quiet: bool = False):
         await self.refresh_md()
-        closing = "Okay, stopping here." if stopped else "Lovely."
+        closing = "I'll leave it there for now." if quiet else ("Okay, stopping here." if stopped else "Lovely.")
         if saved:
             chapters = sorted({CHAPTER_LABELS.get(s.get("chapter"), "") for s in saved} - {""})
             about = f", about {_join_names(chapters)}" if chapters else ""
             closing += f" I saved {_plural(len(saved), 'story')} from {teller['name']}{about}. Thank you."
         else:
-            closing += " Nothing new was saved this time."
+            closing += " We can pick it up another time." if quiet else " Nothing new was saved this time."
         await self.capability_worker.speak(closing)
 
     async def record_answer(self, teller: dict, data: dict, chapter: str, question: str,
@@ -847,22 +905,26 @@ class FamilyStoryKeeperCapability(MatchingCapability):
             if story["audio"] and extra_audio:
                 story["audio_more"] = await self.upload_clip(
                     teller, data, f"{teller['name']} - {story['title']} (part 2)", extra_audio)
+            if story["audio"] and extra_audio and not story["audio_more"]:
+                await self.capability_worker.speak(
+                    "I kept the first part of the recording. The rest is saved as words.")
             if not story["audio"] and not self.upload_warned:
                 self.upload_warned = True
                 await self.capability_worker.speak(
                     "I couldn't keep the recording this time, but the words are saved.")
         snapshot = self.copy(data)
+        last = self.index.get("last") or {}
         data["stories"].append(story)
         data["next_id"] += 1
-        if not self.store_key(self.teller_key(teller["id"]), data):
+        self.index["last"] = {"teller": teller["id"], "story": story["id"]}
+        if not self.save_all():
             data.clear()
             data.update(snapshot)
+            self.index["last"] = last
             for file_id in (story["audio"], story["audio_more"]):
                 if file_id:
                     await self.delete_drive(file_id)
             return None
-        self.index["last"] = {"teller": teller["id"], "story": story["id"]}
-        self.store_key(INDEX_KEY, self.index)
         self.log(f"story saved audio={bool(story['audio'])} total={len(data['stories'])}")
         return story
 
@@ -871,12 +933,17 @@ class FamilyStoryKeeperCapability(MatchingCapability):
     async def listen(self, query: str, another: bool = False):
         entries = []
         for teller in self.index["tellers"]:
-            for story in self.load_teller(teller["id"])["stories"]:
+            stories = self.load_teller(teller["id"])["stories"]
+            if teller["id"] in self.bad_tellers:
+                continue
+            for story in stories:
                 if not (another and f"{teller['id']}:{story['id']}" in self.played):
                     entries.append((teller, story))
         if not entries:
             message = ("That's every story I have on that." if another else
                        "There are no stories saved yet. Say record a story to start one.")
+            if self.bad_tellers and not another:
+                message = "I can't reach the saved stories right now. Try again in a little while."
             self.last_mode = ""
             await self.capability_worker.speak(message)
             return
@@ -905,10 +972,15 @@ class FamilyStoryKeeperCapability(MatchingCapability):
     async def play_story(self, teller: dict, story: dict):
         await self.capability_worker.speak(f"Here's {teller['name']}, on {story.get('title', 'a memory')}.")
         clips = []
-        for file_id in (story.get("audio", ""), story.get("audio_more", "")):
-            clip = await self.download_clip(file_id) if file_id else None
+        expected = [f for f in (story.get("audio", ""), story.get("audio_more", "")) if f]
+        for file_id in expected:
+            clip = await self.download_clip(file_id)
             if clip:
                 clips.append(clip)
+        if expected and not clips:
+            self.log_error("No clip could be downloaded; reading the words instead")
+        if clips and len(clips) < len(expected):
+            await self.capability_worker.speak("Part of this recording didn't load, so you'll hear only some of it.")
         if clips:
             try:
                 self.worker.music_mode_event.set()
@@ -985,9 +1057,9 @@ class FamilyStoryKeeperCapability(MatchingCapability):
             return
         snapshot = self.copy(self.index)
         self.index["queue"].append({"teller": teller["id"], "question": question[:200]})
-        if not self.store_key(INDEX_KEY, self.index):
+        if not self.save_all():
             self.index = snapshot
-            await self.capability_worker.speak("Sorry, I couldn't save that.")
+            await self.capability_worker.speak(self.save_failed_line(""))
             return
         await self.capability_worker.speak(f"Done. I'll ask {teller['name']} at the next session.")
 
@@ -1001,6 +1073,9 @@ class FamilyStoryKeeperCapability(MatchingCapability):
         parts = []
         for teller in tellers[:3]:
             stories = self.load_teller(teller["id"])["stories"]
+            if teller["id"] in self.bad_tellers:
+                parts.append(f"I can't read {teller['name']}'s stories right now.")
+                continue
             covered = [CHAPTER_LABELS[c] for c in CHAPTER_IDS if any(s.get("chapter") == c for s in stories)]
             missing = [CHAPTER_LABELS[c] for c in CHAPTER_IDS if CHAPTER_LABELS[c] not in covered]
             line = f"{teller['name']} has {_plural(len(stories), 'story')}"
@@ -1030,17 +1105,17 @@ class FamilyStoryKeeperCapability(MatchingCapability):
             return
         snapshot = self.copy(data)
         data["stories"] = [s for s in data["stories"] if s is not story]
-        if not self.store_key(self.teller_key(teller["id"]), data):
+        self.index["last"] = {}
+        if not self.save_all():
             data.clear()
             data.update(snapshot)
+            self.index["last"] = last
             await self.capability_worker.speak("Sorry, I couldn't delete that. Nothing was changed.")
             return
         drive_failed = False
         for file_id in (story.get("audio"), story.get("audio_more")):
             if file_id and not await self.delete_drive(file_id):
                 drive_failed = True
-        self.index["last"] = {}
-        self.store_key(INDEX_KEY, self.index)
         await self.refresh_md()
         await self.capability_worker.speak(
             "Deleted, but I couldn't remove the recording from Google Drive. You can delete it there."
@@ -1061,9 +1136,11 @@ class FamilyStoryKeeperCapability(MatchingCapability):
             await self.capability_worker.speak(f"I can't read {teller['name']}'s stories right now. Nothing was deleted.")
             return
         count = len(data["stories"])
+        recordings = ", including the recordings" if any(s.get("audio") for s in data["stories"]) else ""
         decision, _ = await self.confirm(
-            f"This permanently deletes all {_plural(count, 'story')} from {teller['name']}, "
-            "including the recordings. Are you sure?"
+            f"This removes {teller['name']}, who has no saved stories. Are you sure?" if not count else
+            f"This permanently deletes {'the one story' if count == 1 else 'all ' + _plural(count, 'story')} "
+            f"from {teller['name']}{recordings}. Are you sure?"
         )
         if decision != "yes":
             if decision != "exit":
@@ -1074,7 +1151,7 @@ class FamilyStoryKeeperCapability(MatchingCapability):
         self.index["queue"] = [q for q in self.index["queue"] if q.get("teller") != teller["id"]]
         if self.index.get("last", {}).get("teller") == teller["id"]:
             self.index["last"] = {}
-        if not self.store_key(INDEX_KEY, self.index):
+        if not self.save_all():
             self.index = snapshot
             await self.capability_worker.speak("Sorry, I couldn't delete that. Nothing was changed.")
             return
@@ -1087,28 +1164,19 @@ class FamilyStoryKeeperCapability(MatchingCapability):
                 for file_id in (story.get("audio"), story.get("audio_more")):
                     if file_id and not await self.delete_drive(file_id):
                         drive_failed = True
-        key_failed = False
-        try:
-            response = self.capability_worker.delete_key(self.teller_key(teller["id"]))
-            key_failed = isinstance(response, dict) and response.get("success") is False
-        except Exception as error:
-            key_failed = True
-            self.log_error(f"Teller key delete failed: {type(error).__name__}")
         self.tellers.pop(teller["id"], None)
         await self.refresh_md()
-        if drive_failed or key_failed:
+        if drive_failed:
             await self.capability_worker.speak(
-                f"{teller['name']} is removed from the list, but I couldn't delete everything. "
-                + ("Their recordings are still in your Google Drive. " if drive_failed else "")
-                + ("Some saved text may remain. " if key_failed else "")
-                + "Deleting the Family Stories folder in Drive removes the recordings.")
+                f"{teller['name']} is removed, but their recordings are still in your Google Drive. "
+                f"Deleting the {ROOT_FOLDER_NAME} folder in Drive removes them.")
             return
         await self.capability_worker.speak(f"All of {teller['name']}'s stories are deleted.")
 
     async def set_private(self, private: bool):
         snapshot = self.copy(self.index)
         self.index["private"] = private
-        if not self.store_key(INDEX_KEY, self.index):
+        if not self.save_all():
             self.index = snapshot
             await self.capability_worker.speak("Sorry, I couldn't change that.")
             return
@@ -1139,10 +1207,22 @@ class FamilyStoryKeeperCapability(MatchingCapability):
             return None
         if not response.ok:
             self.log_error(f"Drive {method} returned {response.status_code}")
-            if response.status_code == 401:
-                self.google_token = ""  # 403 can be a quota or per-file limit, which says nothing about the token
+            revoked = self.drive_reason(response) in ("insufficientPermissions", "authError")
+            if response.status_code == 401 or (response.status_code == 403 and revoked):
+                # A revoked or under-scoped link fails every call, so stop trying this session.
+                # Other 403s (quota, a per-file limit) say nothing about the token.
+                self.google_token = ""
             return None
         return response
+
+    @staticmethod
+    def drive_reason(response) -> str:
+        """Google's error reason, such as insufficientPermissions or storageQuotaExceeded."""
+        try:
+            errors = response.json().get("error", {}).get("errors") or [{}]
+            return str(errors[0].get("reason") or "")
+        except Exception:
+            return ""
 
     async def create_folder(self, name: str, parent: str = "") -> str:
         meta = {"name": name, "mimeType": FOLDER_MIME}
@@ -1160,7 +1240,7 @@ class FamilyStoryKeeperCapability(MatchingCapability):
             if not root:
                 return ""
             self.index["root_folder"] = root
-            self.store_key(INDEX_KEY, self.index)
+            self.save_all()
         data["folder"] = await self.create_folder(teller["name"], self.index["root_folder"])
         return data["folder"]
 
@@ -1210,27 +1290,74 @@ class FamilyStoryKeeperCapability(MatchingCapability):
         if not self.index_ok and key == INDEX_KEY:
             self.log_error("Not saving: the saved index could not be read this session")
             return False
-        if key.startswith(TELLER_KEY_PREFIX) and key[len(TELLER_KEY_PREFIX):] in self.bad_tellers:
-            self.log_error("Not saving: this teller's stories could not be read this session")
-            return False
         methods = [self.capability_worker.create_key, self.capability_worker.update_key]
         if key in self.known_keys:
             methods.reverse()  # it exists already, so skip the create that is sure to fail
         for method in methods:
             try:
-                if ok(method(key, value)):
+                response = method(key, value)
+                if ok(response):
                     self.known_keys.add(key)
                     return True
+                if "maximum of" in str((response or {}).get("detail") if isinstance(response, dict) else "").lower():
+                    self.store_problem = "full"  # the account already holds OpenHome's 10-key maximum
             except Exception as error:
                 self.log_error(f"Context save attempt failed: {type(error).__name__}")
-        self.log_error("Context save failed")
+        self.log_error(f"Context save failed{' (storage full)' if self.store_problem == 'full' else ''}")
         return False
+
+    def save_all(self) -> bool:
+        """Save the index and every storyteller's stories as one value in INDEX_KEY.
+
+        Refused after a failed read, so stories that couldn't be read are never saved over.
+        """
+        if not self.index_ok or self.bad_tellers:
+            self.log_error("Not saving: some saved stories could not be read this session")
+            return False
+        payload = self.copy(self.index)
+        payload["version"] = 2
+        payload["stories"] = {}
+        for teller in self.index["tellers"]:
+            data = self.load_teller(teller["id"])
+            payload["stories"][teller["id"]] = {"folder": data["folder"], "stories": data["stories"],
+                                                "next_id": data["next_id"]}
+        if len(json.dumps(payload)) > MAX_STORE_CHARS:
+            self.store_problem = "too_big"
+            self.log_error("Not saving: the stories would be too large for one stored value")
+            return False
+        if not self.store_key(INDEX_KEY, payload):
+            return False
+        self.remove_legacy_keys()
+        return True
+
+    def remove_legacy_keys(self):
+        """After a successful one-key save, remove the per-storyteller keys older versions wrote."""
+        for teller_id in list(self.legacy_keys):
+            try:
+                response = self.capability_worker.delete_key(self.teller_key(teller_id))
+                self.log(f"old storage key removed ok={isinstance(response, dict) and response.get('success')}")
+            except Exception as error:
+                self.log_error(f"Old storage key not removed: {type(error).__name__}")
+            self.legacy_keys.discard(teller_id)
+
+    def save_failed_line(self, after: str) -> str:
+        if self.store_problem == "full":
+            line = ("OpenHome's saved-data space is full, so I couldn't save that. "
+                    "Clearing data from an ability you no longer use frees space.")
+        elif self.store_problem == "too_big":
+            line = "The story collection is full, so I couldn't save that. Deleting old stories frees space."
+        else:
+            line = "Sorry, I couldn't save that."
+        return f"{line} {after}".strip()
 
     def read_key(self, key: str):
         """(ok, data). ok is False when storage could not be read; a key never saved is ok with data None."""
         try:
             result = self.capability_worker.get_single_key(key)
-            if not isinstance(result, dict) or result.get("error"):
+            if result is None:
+                return True, None  # some SDK versions return None for a key that was never saved
+            # A missing key comes back as {"key": "", "value": None}; a failure carries "success": False.
+            if not isinstance(result, dict) or result.get("success") is False or result.get("error"):
                 raise ValueError("unexpected storage reply")
             data = result.get("value")
             if isinstance(data, str):
@@ -1256,23 +1383,36 @@ class FamilyStoryKeeperCapability(MatchingCapability):
         queue = [q for q in data.get("queue", [])
                  if isinstance(q, dict) and isinstance(q.get("question"), str)][:MAX_QUEUED_QUESTIONS]
         next_teller = data.get("next_teller") if isinstance(data.get("next_teller"), int) else len(tellers) + 1
-        self.index = {"version": 1, "tellers": tellers[:MAX_TELLERS], "queue": queue,
+        self.index = {"version": 2, "tellers": tellers[:MAX_TELLERS], "queue": queue,
                       "root_folder": str(data.get("root_folder") or ""), "private": data.get("private") is True,
                       "next_teller": next_teller,
                       "last": data.get("last") if isinstance(data.get("last"), dict) else {}}
+        stored = data.get("stories") if isinstance(data.get("stories"), dict) else None
+        for teller in self.index["tellers"]:
+            if stored is not None:
+                self.tellers[teller["id"]] = self.clean_teller(teller["id"], stored.get(teller["id"]))
+                continue
+            # Saved by an older version, one key per storyteller: read it once, and remove it after the next save.
+            ok, old = self.read_key(self.teller_key(teller["id"]))
+            if not ok:
+                self.bad_tellers.add(teller["id"])
+            elif old is not None:
+                self.legacy_keys.add(teller["id"])
+            self.tellers[teller["id"]] = self.clean_teller(teller["id"], old)
 
-    def load_teller(self, teller_id: str) -> dict:
-        if teller_id in self.tellers:
-            return self.tellers[teller_id]
-        ok, data = self.read_key(self.teller_key(teller_id))
-        if not ok:
-            self.bad_tellers.add(teller_id)
-        data = data or {}
+    @staticmethod
+    def clean_teller(teller_id: str, data) -> dict:
+        data = data if isinstance(data, dict) else {}
         stories = [s for s in data.get("stories", [])
                    if isinstance(s, dict) and isinstance(s.get("id"), str) and isinstance(s.get("transcript"), str)]
         next_id = data.get("next_id") if isinstance(data.get("next_id"), int) else len(stories) + 1
-        self.tellers[teller_id] = {"version": 1, "id": teller_id, "folder": str(data.get("folder") or ""),
-                                   "stories": stories[:MAX_STORIES_PER_TELLER], "next_id": next_id}
+        return {"version": 1, "id": teller_id, "folder": str(data.get("folder") or ""),
+                "stories": stories[:MAX_STORIES_PER_TELLER], "next_id": next_id}
+
+    def load_teller(self, teller_id: str) -> dict:
+        """A storyteller's stories, already loaded with the index."""
+        if teller_id not in self.tellers:
+            self.tellers[teller_id] = self.clean_teller(teller_id, None)
         return self.tellers[teller_id]
 
     def render_md(self) -> str:
@@ -1306,6 +1446,10 @@ class FamilyStoryKeeperCapability(MatchingCapability):
         return "\n".join(lines) + "\n"
 
     async def refresh_md(self):
+        if self.bad_tellers or not self.index_ok:
+            # Some stories couldn't be read, so the note would be wrong. Keep the last good one.
+            self.log("Highlights note left as it was: some stories couldn't be read")
+            return
         try:
             content = self.render_md()
             if await self.capability_worker.check_if_file_exists(MD_FILE, False):
