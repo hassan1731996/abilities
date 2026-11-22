@@ -56,10 +56,10 @@ These are only read, never written. They're held in memory for the session only,
 ### Which tools run without asking
 A tool runs straight away only when **all three** are true:
 - The server marks it read-only (`readOnlyHint: true`) and doesn't mark it destructive.
-- Neither its name nor the start of its description has a write word such as send, create, add, update, delete, pay, book, cancel, publish or run.
+- Its name doesn't start with a write word such as send, create, add, update, delete, pay, book, cancel, publish or run, and the start of its description has no plain write verb ("Sends", "Deletes"). Words that are often nouns, like commit, email or update, only count as the first word of the name, so `list_commits` or `search_emails` still run without asking.
 - None of its values came from your stored details (see above).
 
-Everything else asks for confirmation first. That includes any tool the server hasn't marked at all, such as DeepWiki's tools and most Zapier actions. Tools that aren't marked read-only, or whose name reads like a write even though the server marked them read-only, also get a "this might not be undoable" warning, unless the server explicitly marks them non-destructive. The confirmation always names the tool in code, so the spoken wording can't hide which tool will run. MCP treats unmarked tools as possibly destructive.
+Everything else asks for confirmation first. That includes any tool the server hasn't marked at all, such as DeepWiki's tools and most Zapier actions. Tools that aren't marked read-only, or whose name starts with a write word even though the server marked them read-only, also get a "this might not be undoable" warning, unless the server explicitly marks them non-destructive. The confirmation always names the tool in code, so the spoken wording can't hide which tool will run. MCP treats unmarked tools as possibly destructive.
 
 ### Safety and privacy
 - **Untrusted server content.** Tool descriptions and tool output come from a third party. They are passed to the language model as clearly marked data, with instructions never to follow anything written inside them. MCP Bridge makes exactly one tool call per request you make, and output from one call never triggers another.
@@ -84,7 +84,7 @@ Everything else asks for confirmation first. That includes any tool the server h
   - long-running task tools
   - change subscriptions
 - **Images and audio.** If a tool returns them, MCP Bridge says it got them but can't share them here.
-- **Timeouts.** A tool call times out after 30 seconds of waiting, and MCP Bridge stops waiting after 45 seconds in total even if a server keeps sending a trickle of data (connecting and listing tools have their own total limits of 45 and 60 seconds). A busy server (429 or a 5xx reply) is reported as busy, and is not mistaken for an older kind of server. Real servers usually answer in 5 to 10 seconds, so MCP Bridge says a short filler first ("Checking with Zapier", then varied ones like "One sec").
+- **Timeouts.** A tool call times out after 30 seconds of waiting, and MCP Bridge stops waiting after 45 seconds in total even if a server keeps sending a trickle of data (connecting and listing tools have their own total limits of 45 and 60 seconds). A busy server (429, or a 5xx reply with no error message in it) is reported as busy, and is not mistaken for an older kind of server. If a 5xx reply carries the server's own error, that error is reported instead. If a call that changes something times out, MCP Bridge says it may still go through, so you can check before trying again. Real servers usually answer in 5 to 10 seconds, so MCP Bridge says a short filler first ("Checking with Zapier", then varied ones like "One sec").
 
 ### How it differs from existing options
 - **n8n Commander:** you build and wire a webhook for each workflow. MCP Bridge finds the server's tools on its own, through the MCP standard.
